@@ -58,13 +58,9 @@ $DOCKER_CMD run -dt \
     -v /dev/dri:/dev/dri \
     --security-opt apparmor:unconfined \
     -v /home/pi/temp:/root/temp \
-    --device=/dev/i2c-1 \
-    --device=/dev/i2c-0 \
+    -v /dev:/dev \
     -v "$PROJECT_DIR:/home/$USER_NAME/workspace$VOL_OPTS" \
     -w /home/$USER_NAME/workspace \
-    --device=/dev/video0 \
-    --device=/dev/video1 \
-    --device=/dev/gpiomem \
     $GPU_OPTS \
     $EXTRA_OPTS \
     $IMAGE_NAME:$IMAGE_TAG

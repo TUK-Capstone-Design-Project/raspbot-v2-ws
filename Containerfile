@@ -154,10 +154,57 @@ RUN cd /tmp && \
 
 # 환경 변수 자동 로드
 RUN echo "source /opt/ros/humble/setup.bash" >> /etc/profile.d/ros.sh \
-    && echo "if [ -f /home/$USER_NAME/workspace/install/setup.bash ]; then source /home/$USER_NAME/workspace/install/setup.bash; fi" >> /home/$USER_NAME/.bashrc \
-    && echo "export TURTLEBOT3_MODEL=burger" >> /etc/profile.d/ros.sh \
-    && echo "export GAZEBO_MODEL_PATH=$GAZEBO_MODEL_PATH:/home/$USER_NAME/.gazebo/models:/opt/ros/humble/share/turtlebot3_gazebo/models" >> /etc/profile.d/ros.sh \
-    && echo "export GAZEBO_RESOURCE_PATH=/usr/share/gazebo-11:/usr/share/gazebo_models" >> /etc/profile.d/ros.sh \
-    && echo "export GAZEBO_MODEL_DATABASE_URI=''" >> /etc/profile.d/ros.sh
+    && echo "if [ -f /home/$USER_NAME/workspace/install/setup.bash ]; then source /home/$USER_NAME/workspace/install/setup.bash; fi" >> /home/$USER_NAME/.bashrc
+
+RUN apt-get update && \
+    apt-get upgrade -y && \
+    apt-get install -y --no-install-recommends \
+    libgstreamer1.0-dev \
+    libgstreamer-plugins-base1.0-dev \
+    libgstreamer-plugins-good1.0-dev \
+    libgstreamer-plugins-bad1.0-dev \
+    gstreamer1.0-plugins-base \
+    gstreamer1.0-plugins-good \
+    gstreamer1.0-plugins-bad \
+    libcamera-dev \
+    libcamera-tools \
+    v4l-utils \
+    && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+    libegl-dev libgles-dev libevent-dev \
+    libyaml-dev python3-yaml python3-ply \
+    libgnutls28-dev openssl \
+    python3-pip python3-setuptools python3-wheel \
+    && \
+    apt-get clean && rm -rf /var/lib/apt/lists/* && \
+    pip3 install --upgrade meson jinja2
+
+RUN cd /opt && \
+    git clone https://github.com/raspberrypi/libcamera.git && \
+    cd libcamera && \
+    meson setup build \
+        -Dpipelines=rpi/pisp \
+        -Dgstreamer=enabled \
+        -Dtest=false \
+        -Dlc-compliance=disabled \
+        -Dcam=disabled \
+        -Dqcam=disabled && \
+    ninja -C build install && \
+    ldconfig
+
+RUN echo "export GST_PLUGIN_PATH=/usr/local/lib/aarch64-linux-gnu/gstreamer-1.0" >> /etc/profile.d/gst.sh && \
+    echo "export GST_PLUGIN_PATH=/usr/local/lib/gstreamer-1.0" >> /etc/profile.d/gst.sh && \
+    echo "export LIBCAMERA_IPA_MODULE_PATH=/usr/local/lib/aarch64-linux-gnu/libcamera/ipa" >> /etc/profile.d/libcamera.sh && \
+    echo "export GST_PLUGIN_PATH=/usr/local/lib/aarch64-linux-gnu/gstreamer-1.0" >> /etc/profile.d/gst.sh
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    gstreamer1.0-tools \
+    && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
 
 CMD ["/bin/bash"]

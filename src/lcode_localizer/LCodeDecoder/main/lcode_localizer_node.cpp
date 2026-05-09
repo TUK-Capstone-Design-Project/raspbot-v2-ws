@@ -130,6 +130,8 @@ private:
                     RCLCPP_INFO(this->get_logger(), "map 좌표  x: %.3f m, y: %.3f m, angle: %.3f rad (%.1f°)", ros_x, ros_y, ros_angle_rad, -ros_angle_rad * 180.0 / M_PI);
 
                     publish_all(last_x, last_y, last_th, this->get_clock()->now());
+                } else {
+                    RCLCPP_WARN(this->get_logger(), "L-Code 해독 실패: 유효한 좌표를 얻지 못함");
                 }
             }
         }

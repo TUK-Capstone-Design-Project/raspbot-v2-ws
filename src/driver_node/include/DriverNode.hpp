@@ -21,6 +21,7 @@ private:
   std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
   rclcpp::TimerBase::SharedPtr timeout_timer_;
   rclcpp::TimerBase::SharedPtr odom_timer_;
+  rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr param_cb_handle_;
 
   // 하드웨어 인터페이스
   std::unique_ptr<KinematicsInterface> robot_;

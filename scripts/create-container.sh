@@ -54,11 +54,12 @@ $DOCKER_CMD run -dt \
     --env="QT_X11_NO_MITSHM=1" \
     --env="XAUTHORITY=$XAUTH" \
     -v "$XAUTH:$XAUTH" \
-    -v /tmp/.X11-unix:/tmp/.X11-unix \
+    -v /tmp/.X11-unix:/tmp/.X11-unix:rw \
     -v /dev/dri:/dev/dri \
     --security-opt apparmor:unconfined \
     -v /home/pi/temp:/root/temp \
     -v /dev:/dev \
+    -v /run/udev:/run/udev:ro \
     -v "$PROJECT_DIR:/home/$USER_NAME/workspace$VOL_OPTS" \
     -w /home/$USER_NAME/workspace \
     $GPU_OPTS \

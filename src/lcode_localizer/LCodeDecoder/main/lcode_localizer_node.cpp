@@ -34,6 +34,15 @@ public:
         tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
         // odom_pub_ = this->create_publisher<nav_msgs::msg::Odometry>("/odom", 10);
 
+        // 3. TF 발행용 타이머 (카메라 이미지가 멈춰도 TF 트리가 끊어지지 않도록 고정 주기로 발행)
+        tf_timer_ = this->create_wall_timer(
+            std::chrono::milliseconds(50), [this]() {
+                if (initial_pos_found) {
+                    publish_all(last_x, last_y, last_th, this->get_clock()->now());
+                }
+            }
+        );
+
         img_sub_ = this->create_subscription<sensor_msgs::msg::Image>(
             "/downward_camera/image_raw", rclcpp::SensorDataQoS(),
             std::bind(&LCodeLocalizerNode::image_callback, this, std::placeholders::_1)
@@ -50,13 +59,16 @@ private:
 
     std::unique_ptr<tf2_ros::Buffer>            tf_buffer_;
     std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
+    rclcpp::TimerBase::SharedPtr                tf_timer_;
 
     rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr img_sub_;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr    odom_pub_;
     std::unique_ptr<tf2_ros::TransformBroadcaster>           tf_broadcaster_;
 
     double last_x = 0.0, last_y = 0.0, last_th = 0.0;
-    bool   initial_pos_found = false;
+    // 초기 위치를 못 찾았더라도 일단 (0,0,0)을 기준으로 map->odom을 발행하도록 강제 활성화합니다.
+    // 이렇게 하면 Nav2가 초기에 map 프레임을 찾지 못해 죽는 현상을 방지할 수 있습니다.
+    bool   initial_pos_found = true;
 
     void image_callback(const sensor_msgs::msg::Image::SharedPtr msg)
     {
@@ -64,32 +76,14 @@ private:
         try {
             src = cv_bridge::toCvCopy(msg, "bgr8")->image;
         } catch (cv_bridge::Exception &e) {
+            RCLCPP_WARN(this->get_logger(), "cv_bridge 예외 발생: %s", e.what());
             return;
         }
         auto preprocessor_ = std::make_unique<LCODE::ImgPreprocessor>(*config_);
 
         rclcpp::Time stamp = msg->header.stamp;
 
-        try {
-            geometry_msgs::msg::TransformStamped transform = tf_buffer_->lookupTransform(
-                "map", "base_link", tf2::TimePointZero
-            );
-
-            // Quaternion에서 Yaw 추출
-            tf2::Quaternion q(
-                transform.transform.rotation.x,
-                transform.transform.rotation.y,
-                transform.transform.rotation.z,
-                transform.transform.rotation.w
-            );
-
-            double current_yaw = tf2::getYaw(q);
-
-            RCLCPP_INFO(this->get_logger(), "Nav2의 현재 각도: %.3f rad (%.1f°)", current_yaw, current_yaw * 180.0 / M_PI);
-
-        } catch (tf2::TransformException &ex) {
-            RCLCPP_WARN(this->get_logger(), "TF 변환 실패: %s", ex.what());
-        }
+        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "이미지 콜백 호출됨 - 프레임 수신 중");
 
         if (preprocessor_->run(src)) {
             if (digitizer_->runDigitize(*preprocessor_)) {
@@ -107,12 +101,12 @@ private:
                     // double centered_x = raw_x - 275.0;
                     // double centered_y = raw_y - 275.0;
 
-                    static const double HALF_SIZE = 1000.0 * 0.002 / 2.0;
+                    static const double HALF_SIZE = 550.0 * 0.002 / 2.0;
 
                     // 2. 좌표계 회전: L-Code(→X, ↓Y) -> ROS(→X, ↑Y)
                     // L-Code의 Y축이 아래쪽이므로 반전 필요
                     double ros_x = raw_x * 0.002 - HALF_SIZE;           // -0.55 ~ +0.55
-                    double ros_y = (1000 - raw_y) * 0.002 - HALF_SIZE;   // -0.55 ~ +0.55
+                    double ros_y = (550 - raw_y) * 0.002 - HALF_SIZE;   // -0.55 ~ +0.55
 
                     // 2. 방향(Heading) 계산 (L-Code에서 준 angle 반영);
                     // last_th = raw_angle;
@@ -131,16 +125,17 @@ private:
 
                     publish_all(last_x, last_y, last_th, this->get_clock()->now());
                 } else {
-                    RCLCPP_WARN(this->get_logger(), "L-Code 해독 실패: 유효한 좌표를 얻지 못함");
+                    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "L-Code 해독 실패: 유효한 좌표를 얻지 못함");
                 }
+            } else {
+                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "L-Code 해독 실패: digitizer 처리 실패");
             }
+        } else {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "L-Code 해독 실패: preprocessor 처리 실패 (마커 미발견 등)");
         }
 
-        // [중요] 인식이 실패해도 마지막 위치를 계속 발행 (map -> odom 연결 유지)
-        if (initial_pos_found) {
-            // publish_all(last_x, last_y, last_th, stamp);
-            publish_all(last_x, last_y, last_th, this->get_clock()->now());
-        }
+        // [중요] 일정한 주기로 TF를 계속 퍼블리시하기 위해 타이머를 사용하므로
+        // 여기 있던 퍼블리시 코드는 제거했습니다.
     }
 
     void publish_all(double map_x, double map_y, double map_th, const rclcpp::Time &stamp)
@@ -164,11 +159,14 @@ private:
         // --- 이하 base_x, base_y, base_th를 사용 ---
         geometry_msgs::msg::TransformStamped odom_to_base;
         try {
+            if (!tf_buffer_->canTransform("odom", "base_link", tf2::TimePointZero)) {
+                return; // 아직 트리가 없으면 종료
+            }
             odom_to_base = tf_buffer_->lookupTransform(
                 "odom", "base_link", tf2::TimePointZero
             );
         } catch (const tf2::TransformException &ex) {
-            RCLCPP_WARN(this->get_logger(), "odom->base_link TF 조회 실패: %s", ex.what());
+            RCLCPP_DEBUG(this->get_logger(), "odom->base_link TF 조회 보류 중: %s", ex.what());
             return;
         }
 

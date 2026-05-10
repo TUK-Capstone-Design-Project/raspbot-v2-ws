@@ -33,13 +33,26 @@ private:
   const double W_ = 0.15;
   const double K_ = L_ + W_; // 회전 계수
 
-  // 속도 변환 계수 (m/s -> PWM)
-  const double SPEED_SCALE_ = 40.0; // 재조정 필요시 실험적으로 조정
-
   // 옴니바퀴 미끄러짐 보정용 마지막 명령 저장
   double last_vx_ = 0.0;
   double last_vy_ = 0.0;
   double last_wz_ = 0.0;
+
+public:
+  // ── 모터 튜닝 파라미터 (ROS param 으로 주입; 런타임 조정 가능) ─────────
+  // 속도 변환 계수 (m/s -> PWM). PWM = round(wheel_speed * speed_scale_)
+  double speed_scale_ = 40.0;
+
+  // |PWM| 가 이 값 미만이면 모터가 못 움직이므로 0으로 무시 (jitter 방지)
+  int pwm_deadzone_ = 5;
+
+  // 0 < |PWM| < min_pwm_ 인 경우 부호를 유지한 채 ±min_pwm_ 로 끌어올림
+  // → DC 모터의 정지 마찰을 이기는 최소 시동 전압 보상
+  int min_pwm_ = 80;
+
+  // 상한 (드라이버 보호)
+  int max_pwm_ = 255;
+private:
 
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr sim_pub_;
 

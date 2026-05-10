@@ -204,6 +204,10 @@ RUN echo "export GST_PLUGIN_PATH=/usr/local/lib/aarch64-linux-gnu/gstreamer-1.0"
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     gstreamer1.0-tools \
+    libgtk-3-dev \
+    libcanberra-gtk-module \
+    libcanberra-gtk3-module \
+    dbus-x11 \
     && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 

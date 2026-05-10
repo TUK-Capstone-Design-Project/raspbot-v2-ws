@@ -63,11 +63,20 @@ void KinematicsInterface::set_motor(int id, int speed) {
   if (fd_ < 0)
     return;
 
-  // 속도 범위 제한 (-255 ~ 255)
-  int safe_speed = std::max(-255, std::min(255, speed));
+  // ── 데드밴드 + 최소시동 PWM 보정 ──────────────────────────────────────
+  int abs_in = std::abs(speed);
+  int sign   = (speed > 0) - (speed < 0);
+  int out;
+  if (abs_in == 0 || abs_in < pwm_deadzone_) {
+    out = 0; // 의미있는 명령 아님 → 강제 정지
+  } else if (abs_in < min_pwm_) {
+    out = sign * min_pwm_; // 정지마찰 이기도록 끌어올림
+  } else {
+    out = std::max(-max_pwm_, std::min(max_pwm_, speed));
+  }
 
-  uint8_t dir = (safe_speed < 0) ? 1 : 0;
-  uint8_t abs_speed = static_cast<uint8_t>(std::abs(safe_speed));
+  uint8_t dir = (out < 0) ? 1 : 0;
+  uint8_t abs_speed = static_cast<uint8_t>(std::abs(out));
   uint8_t motor_id = static_cast<uint8_t>(id);
 
   // 야붐(Yahboom) 등의 표준 프로토콜: [Register, ID, Direction, Speed]
@@ -104,8 +113,8 @@ void KinematicsInterface::drive(double vx, double vy, double wz) {
   double rr = vx - vy + (K_ * wz);
 
   // 물리 속도(m/s)를 모터 드라이버 PWM 값으로 스케일링하여 전송
-  set_motor(0, static_cast<int>(std::round(fl * SPEED_SCALE_)));
-  set_motor(1, static_cast<int>(std::round(fr * SPEED_SCALE_)));
-  set_motor(2, static_cast<int>(std::round(rl * SPEED_SCALE_)));
-  set_motor(3, static_cast<int>(std::round(rr * SPEED_SCALE_)));
+  set_motor(0, static_cast<int>(std::round(fl * speed_scale_)));
+  set_motor(1, static_cast<int>(std::round(fr * speed_scale_)));
+  set_motor(2, static_cast<int>(std::round(rl * speed_scale_)));
+  set_motor(3, static_cast<int>(std::round(rr * speed_scale_)));
 }

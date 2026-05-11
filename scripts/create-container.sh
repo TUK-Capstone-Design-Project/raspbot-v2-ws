@@ -44,10 +44,27 @@ if command -v xhost >/dev/null 2>&1; then
     xhost +local:$XHOST_TYPE >/dev/null 2>&1 || true
 fi
 
+# 컨테이너에 심을 VS Code 메타데이터 JSON 생성 (줄바꿈 제거)
+DEV_METADATA=$(cat << EOF | tr -d '\n' | tr -s ' '
+[
+  {
+    "remoteUser": "${USER_NAME}",
+    "workspaceFolder": "/home/${USER_NAME}/workspace",
+    "customizations": {
+      "vscode": {
+        "extensions": [ ${VSCODE_EXTENSIONS} ]
+      }
+    }
+  }
+]
+EOF
+)
+
 # 컨테이너 실행 (백그라운드 -d 모드)
 echo "--- [$DOCKER_CMD] 컨테이너 실행 시작"
 $DOCKER_CMD run -dt \
     --name $CONTAINER_NAME \
+    --label devcontainer.metadata="$DEV_METADATA" \
     --privileged=true \
     --net=host \
     --env="DISPLAY=$DISPLAY" \

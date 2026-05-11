@@ -75,11 +75,11 @@ int main(int argc, char *argv[]) {
         image_pub->publish(*msg);
 
         // 10 프레임마다 로컬 이미지 저장
-        if (frame_count % 10 == 0) {
-            std::string file_name = std::format("./frames/frame_{}.png", frame_count);
-            const std::vector<int> params = {cv::IMWRITE_PNG_COMPRESSION, 9};
-            cv::imwrite(file_name, frame, params);
-        }
+        // if (frame_count % 10 == 0) {
+        //     std::string file_name = std::format("./frames/frame_{}.png", frame_count);
+        //     const std::vector<int> params = {cv::IMWRITE_PNG_COMPRESSION, 9};
+        //     cv::imwrite(file_name, frame, params);
+        // }
         // cv::imshow("Camera Frame", frame);
         frame_count++;
         

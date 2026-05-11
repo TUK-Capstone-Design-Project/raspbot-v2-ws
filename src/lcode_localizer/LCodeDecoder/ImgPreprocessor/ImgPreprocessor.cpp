@@ -1,6 +1,8 @@
 #include "ImgPreprocessor/ImgPreprocessor.hpp"
 #include "Common/Line.h"
 #include "ConfigSettings/ConfigSettings.hpp"
+#include <opencv2/highgui.hpp>
+#include <opencv2/ximgproc.hpp>
 using namespace std;
 
 // #define SHOW_VIDEO
@@ -12,11 +14,12 @@ ImgPreprocessor::ImgPreprocessor(ConfigSettings &config) : lineProcessor_(config
   this->ROI_width_dots  = config.getROI_width_dot();  /// ROI 영역의 가로 점 갯수
   this->ROI_height_dots = config.getROI_height_dot(); /// ROI 영역의 세로 점 갯수
   // this->required_baseline_cnt = 계산 공식 - (ROI_width_dots - 1) / 6 + 1;
+
   this->required_baseline_cnt = 3;
 
   this->expansion_point_num = (ROI_height_dots - 1) / 6;
 
-  int ROI_size = 1200; // ROI 영역 size
+  int ROI_size = 800; // ROI 영역 size
 
   this->ROI_width_size  = ROI_size * (static_cast<float>(ROI_width_dots) / (ROI_height_dots + ROI_width_dots));
   this->ROI_height_size = ROI_size * (static_cast<float>(ROI_height_dots) / (ROI_height_dots + ROI_width_dots));
@@ -53,6 +56,8 @@ void ImgPreprocessor::drawDetectedDots(cv::Mat &img, vector<cv::KeyPoint> &keypo
 
 void ImgPreprocessor::eraseDetectedDots(cv::Mat &img, vector<cv::KeyPoint> &dots) {
   for (const auto &dot : dots) {
+    // dot.size + 0.5 => 기존 dot size보다 살짝 더 크게 지우도록 해서, 선 검출에 방해가 되는 점의 흔적을 최대한
+    // 제거하려는 의도
     circle(img, dot.pt, static_cast<int>(dot.size + 0.5), {0}, -1);
   }
 #ifdef SHOW_VIDEO
@@ -62,20 +67,31 @@ void ImgPreprocessor::eraseDetectedDots(cv::Mat &img, vector<cv::KeyPoint> &dots
 }
 
 void ImgPreprocessor::binarizeImage() {
-  constexpr int maxValue       = 255;
-  constexpr int adaptiveMethod = cv::ADAPTIVE_THRESH_GAUSSIAN_C;
-  constexpr int thresholdType  = cv::THRESH_BINARY_INV;
-  constexpr int blockSize      = 15; // 11~21 normally  , 홀수
-  int           C = 8; //-10~ 10 normally 가중평균에서 빼는 상수 .. -> threahold 조정역할 클수록 이미지 어두움
-  cv::adaptiveThreshold(this->gray, this->binarized, maxValue, adaptiveMethod, thresholdType, blockSize, C);
+  constexpr int mode = 0;
+  if (mode == 0) {
+    double k                  = 0.07; // 보통 -0.2 ~ -0.5 사이. 작을수록 더 많은 점을 잡습니다.
+    int    blockSize          = 31;   // 점의 크기보다 커야 합니다.
+    int    binarizationMethod = cv::ximgproc::BINARIZATION_SAUVOLA;
+    // Niblack 적용
+    // 결과는 검은 배경에 흰 점(BINARY) 또는 반대(BINARY_INV)로 설정 가능합니다.
+    cv::ximgproc::niBlackThreshold(this->gray, this->binarized, 255, cv::THRESH_BINARY_INV, blockSize, k,
+                                   binarizationMethod);
+  } else {
+    constexpr int maxValue       = 255;
+    constexpr int adaptiveMethod = cv::ADAPTIVE_THRESH_GAUSSIAN_C;
+    constexpr int thresholdType  = cv::THRESH_BINARY_INV;
+    constexpr int blockSize      = 15; // 11~21 normally  , 홀수
+    int           C = 8; //-10~ 10 normally 가중평균에서 빼는 상수 .. -> threahold 조정역할 클수록 이미지 어두움
+    cv::adaptiveThreshold(this->gray, this->binarized, maxValue, adaptiveMethod, thresholdType, blockSize, C);
+  }
 
 #ifdef SHOW_VIDEO
   imshow("Thresholded", binarized);
-  // waitKey(1)
+  waitKey(0);
 #endif //! SHOW_VIDEO
 }
 
-void ImgPreprocessor::findClosestDotToCP() {
+auto ImgPreprocessor::findClosestDotToCP() -> bool {
 
   // 1. 중심점 계산
   this->img_cross_point = cv::Point2f(src.cols * 0.5f, src.rows * 0.5f);
@@ -102,15 +118,12 @@ void ImgPreprocessor::findClosestDotToCP() {
       best_dot    = &dot;
     }
   }
-
-  // 4. 결과 업데이트 및 시각화
-  if (best_dot != nullptr) {
-    this->closest_dot_to_cross_point = *best_dot;
-    cv::circle(src, closest_dot_to_cross_point.pt, 5, cv::Scalar(255, 20, 5), -1);
-  } else {
-    // 찾지 못했을 경우의 예외 처리 (예: 점 초기화)
-    this->closest_dot_to_cross_point = cv::KeyPoint();
+  // 4. 결과 처리
+  if (best_dot == nullptr) {
+    return false;
   }
+  this->closest_dot_to_cross_point = *best_dot;
+  return true;
 }
 
 void ImgPreprocessor::orderBaseLinesByClosestDot() {
@@ -140,33 +153,41 @@ auto ImgPreprocessor::distanceFromPointToLine(cv::Point pt, cv::Point lineStart,
 
 auto ImgPreprocessor::findValidLinesByDotsLocation() -> bool {
   vector<vector<Line<int>>> validated_lines;
-  double                    tolerenceMax_between_line_to_dot = closest_dot_to_cross_point.size * 1.5;
-  // cout<<this->closest_dot_to_cross_point.size;
+  double                    tolerenceMax_between_line_to_dot = closest_dot_to_cross_point.size * 2.5;
+  const int                 required_dots                    = (expansion_point_num * 2) + 1; // 반복 연산 변수화
 
   // 선 위 점이 없는 선들을 제거
   for (const auto &line : closestLines) {
+    vector<Line<int>> valid_line_group; // 그룹을 담을 벡터를 첫 번째 루프 안에 선언
+
     for (const auto &lin : line) {
-      int               cnt = 0;
-      vector<Line<int>> validated_line;
+      int cnt = 0;
       for (const auto &dot : all_detected_dots_) {
         if (this->isKeyPointNearLine(dot, lin.pt1, lin.pt2, tolerenceMax_between_line_to_dot)) {
           cnt++;
         }
-        if (cnt >= (expansion_point_num * 2) + 1) {
+        if (cnt >= required_dots) {
           break;
         }
       }
-      if (cnt >= (expansion_point_num * 2) + 1) {
-        validated_line.push_back(lin);
-        validated_lines.push_back(validated_line);
-      } else {
-        break;
+
+      // 조건에 맞는 선만 현재 그룹에 추가
+      if (cnt >= required_dots) {
+        valid_line_group.push_back(lin);
       }
+      // 조건에 안 맞는다고 break 하지 않음 (나머지 선들도 검사해야 하므로)
+    }
+
+    // 그룹 내에 유효한 선이 하나라도 있으면 최종 결과에 추가
+    if (!valid_line_group.empty()) {
+      validated_lines.push_back(valid_line_group);
     }
   }
+
   closestLines = validated_lines;
   return true;
 }
+
 auto ImgPreprocessor::findValidLinesByDotsNum() -> bool {
   bool callCnt = 0;
   // 한 프레임에 두번만 반복
@@ -194,11 +215,12 @@ auto ImgPreprocessor::findValidLinesByDotsNum() -> bool {
     }
     // isKeyPointNearLine을 통해 도출된 각 기준선 마다의 Dot의 갯수를 검사. 2.5배 이상의 갯수를 가지고 있는 해당라인을
     // 지우고 다시 검사. check validate Lines
+    const float comp_dot_num_tolerence = 1.5;
     for (int l = 0; l < required_baseline_cnt; l++) {
       bool  check              = true;
       float comp_keypoitns_cnt = static_cast<float>(nth_closest_keypoints_on_baseline[i].size());
       for (int j = l; j < required_baseline_cnt; j++) {
-        float comp2_cnt = static_cast<float>(nth_closest_keypoints_on_baseline[j].size()) * 2.5;
+        float comp2_cnt = static_cast<float>(nth_closest_keypoints_on_baseline[j].size()) * comp_dot_num_tolerence;
         if (comp_keypoitns_cnt >= comp2_cnt) {
           this->closestLines.erase(closestLines.begin() + i + 1);
           check = false;
@@ -570,8 +592,8 @@ void ImgPreprocessor::drawDetectedCornerDots() {
   }
 
   // cv::drawKeypoints(src, two_Corner_dot_on_side_Line1, src, cv::Scalar(255, 255, 0),
-  // cv::DrawMatchesFlags::DRAW_RICH_KEYPOINTS); cv::drawKeypoints(src, two_Corner_dot_on_side_Line2, src, cv::Scalar(0,
-  // 0, 0), cv::DrawMatchesFlags::DRAW_RICH_KEYPOINTS);
+  // cv::DrawMatchesFlags::DRAW_RICH_KEYPOINTS); cv::drawKeypoints(src, two_Corner_dot_on_side_Line2, src,
+  // cv::Scalar(0, 0, 0), cv::DrawMatchesFlags::DRAW_RICH_KEYPOINTS);
 }
 
 auto ImgPreprocessor::arrangeDstQuad(const std::vector<cv::Point2f> &warp_point_candidate) {
@@ -951,7 +973,7 @@ void ImgPreprocessor::normalizeLinePoints(vector<Vec4i> &lines) {
 void ImgPreprocessor::setHoughPAndFindOrientLines(cv::Mat &img_ROI, std::vector<Vec4i> &lines) {
   // HoughLinesP를 위한 세팅값
   int threshold_value = 60;
-  int minLineLength   = 50;
+  int minLineLength   = 40;
   int maxLineGap      = 10;
 
   HoughLinesP(img_ROI, lines, 1, CV_PI / 180, threshold_value, minLineLength, maxLineGap);
@@ -1021,7 +1043,12 @@ auto ImgPreprocessor::checkAndCorrectOrientation() -> bool {
     LBS_error_code = orienting_LineNums_error;
 #ifdef SHOW_VIDEO
     cout << "orienting_line_num_error, line size : " << linesInfo.size() << endl; // 테스트 코드
-    imshow("orienting_line_num_error", img_ROI);
+
+    cvtColor(img_ROI, img_ROI, COLOR_GRAY2BGR);
+    for (auto l : merged_lines) {
+      line(img_ROI, Point(l[0], l[1]), Point(l[2], l[3]), Scalar(0, 0, 255), 2);
+    }
+    imshow("orienting_line_num_error - detected lines", img_ROI);
     waitKey(1);
 #endif //! SHOW_VIDEO
     return false;
@@ -1120,47 +1147,83 @@ auto ImgPreprocessor::checkAndCorrectOrientation() -> bool {
   return true;
 }
 
-bool ImgPreprocessor::verifyDotCount() {
-  // 필요한 ROI 내의 전체 점의 수를 계산
-  // subRows, subCols 따라 ROI 내 점의 갯수가 모두 필요하지 않으므로 해당 부분 확인해 느슨한 기준 가능
-  int total_dots = (this->ROI_width_dots) * (this->ROI_height_dots);
-  // 대시라인으로 인해 사라지는 점의 수를 계산
-  int dash_loss = (this->required_baseline_cnt) * 8;
+// bool ImgPreprocessor::verifyDotCount() {
+//   // 필요한 ROI 내의 전체 점의 수를 계산
+//   // subRows, subCols 따라 ROI 내 점의 갯수가 모두 필요하지 않으므로 해당 부분 확인해 느슨한 기준 가능
+//   int total_dots = (this->ROI_width_dots) * (this->ROI_height_dots);
+//   // 대시라인으로 인해 사라지는 점의 수를 계산
+//   int dash_loss = (this->required_baseline_cnt) * 8;
 
-  int nums_of_required_pts = total_dots - dash_loss;
+//   int nums_of_required_pts = total_dots - dash_loss;
 
-  if (all_detected_dots_.size() < nums_of_required_pts) {
-    LBS_error_code = SBD_error;
-    return false;
-  }
-  return true;
+//   if (all_detected_dots_.size() < nums_of_required_pts) {
+//     LBS_error_code = SBD_error;
+//     return false;
+//   }
+//   return true;
+// }
+Mat normalizeIllumination(Mat src) {
+  Mat gray;
+  if (src.channels() == 3)
+    cvtColor(src, gray, COLOR_BGR2GRAY);
+  else
+    gray = src.clone();
+
+  // 1. 조명 성분 추출 (매우 큰 커널로 블러 처리)
+  // 커널 사이즈는 점(Dot)의 크기보다 훨씬 커야 합니다 (예: 101, 151 등)
+  Mat illuminationMap;
+  int kernelSize = 151; // 1
+  GaussianBlur(gray, illuminationMap, Size(kernelSize, kernelSize), 0);
+
+  // 2. 배경 나누기 (원본 / 조명 맵)
+  // 0으로 나누는 것을 방지하기 위해 정밀도를 float로 변환하여 계산 후 다시 8비트로 복구
+  Mat result;
+  gray.convertTo(gray, CV_32F);
+  illuminationMap.convertTo(illuminationMap, CV_32F);
+
+  divide(gray, illuminationMap, result, 255.0); // 255를 곱해 밝기 유지
+  result.convertTo(result, CV_8U);
+
+  return result;
 }
-
 auto ImgPreprocessor::run(cv::Mat source) -> bool {
   // 이미지 없음
   if (source.empty()) {
     return false;
   }
 
-  // 이미지 전처리
+  // 1. 이미지 전처리
   if (!this->setupPreprocessing(source)) {
     return false;
   };
 
+  // 조명 보정 (normalize illumination)
+  gray = normalizeIllumination(this->gray);
+  // 대비 보정 (normalize contrast)
+  cv::normalize(gray, gray, 0, 255, cv::NORM_MINMAX);
+
+#ifdef SHOW_VIDEO
+  imshow("Enhanced", this->gray);
+  cv::waitKey(0);
+#endif
+
+  // 2. Dot 검출기 생성 및 점 검출
   DotDetector dotDetector;
   dotDetector.setupParameters(params_);
   dotDetector.detectBySimpleBlobDetector(this->gray, all_detected_dots_);
-  drawDetectedDots(this->src, all_detected_dots_);
 
-  // 검출된 점의 수가 필요한 갯수보다 적을 경우, 에러 처리
-  if (!this->verifyDotCount()) {
+  // 검출된 점 그리기 (디버깅용)
+  drawDetectedDots(this->src, all_detected_dots_);
+  constexpr int required_min_dots = 49; // 7X7 기준
+  if (all_detected_dots_.size() < required_min_dots) {
+    LBS_error_code = SBD_error;
     return false;
   }
 
-  // 이미지 이진화
+  // 3. 이미지 이진화, adatptive thresholding 적용
   this->binarizeImage();
 
-  // 이미지에서 검출된 점들을 지우기 (선 검출에 방해가 될 수 있기 때문)
+  // 4. 이미지에서 검출된 점들을 지우기 (선 검출에 방해가 될 수 있기 때문)
   eraseDetectedDots(binarized, all_detected_dots_);
 
   // 에지 검출
@@ -1174,7 +1237,10 @@ auto ImgPreprocessor::run(cv::Mat source) -> bool {
   // 검출된 선분 그리기
   this->drawClusteredLines();
 
-  this->findClosestDotToCP();
+  // 이미지 중앙에서 가장 가까운 점을 찾음
+  if (findClosestDotToCP()) {
+    cv::circle(src, closest_dot_to_cross_point.pt, 5, cv::Scalar(255, 20, 5), -1);
+  }
 
   this->orderBaseLinesByClosestDot();
 
@@ -1194,6 +1260,8 @@ auto ImgPreprocessor::run(cv::Mat source) -> bool {
   if (!this->findwarpPerspectiveCornerPoint()) {
     return false;
   }
+
+  // 검출된 코너점 그리기
   this->drawDetectedCornerDots();
 
   if (!this->adjustCornersToPredefinedArea()) {

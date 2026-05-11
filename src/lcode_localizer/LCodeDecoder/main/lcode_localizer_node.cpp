@@ -1,8 +1,10 @@
 #include <cmath>
 #include <cv_bridge/cv_bridge.h>
+#include <filesystem>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <opencv2/highgui.hpp>
+#include <opencv2/imgproc.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/image.hpp>
 
@@ -18,11 +20,17 @@
 #include "Digitizer/Digitizer.hpp"
 #include "ImgPreprocessor/ImgPreprocessor.hpp"
 
+#define DECODER_DEBUG_MODE
 class LCodeLocalizerNode : public rclcpp::Node
 {
 public:
     LCodeLocalizerNode() : Node("lcode_localizer_node")
     {
+        #ifdef DECODER_DEBUG_MODE
+        std::filesystem::create_directories("./resize_images"); // 디버깅용 디렉토리 생성
+        std::filesystem::create_directories("./resize_images/success"); // 디버깅용 디렉토리 생성
+        std::filesystem::create_directories("./resize_images/failed"); // 디버깅용 디렉토리 생성
+        #endif
         config_    = std::make_shared<LCODE::ConfigSettings>();
         ba_        = std::make_unique<LCODE::BGArray>(*config_);
         digitizer_ = std::make_unique<LCODE::Digitizer>(*config_);
@@ -68,7 +76,7 @@ private:
     double last_x = 0.0, last_y = 0.0, last_th = 0.0;
     // 초기 위치를 못 찾았더라도 일단 (0,0,0)을 기준으로 map->odom을 발행하도록 강제 활성화합니다.
     // 이렇게 하면 Nav2가 초기에 map 프레임을 찾지 못해 죽는 현상을 방지할 수 있습니다.
-    bool   initial_pos_found = true;
+    bool initial_pos_found = true;
 
     void image_callback(const sensor_msgs::msg::Image::SharedPtr msg)
     {
@@ -85,57 +93,65 @@ private:
 
         RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "이미지 콜백 호출됨 - 프레임 수신 중");
 
-        if (preprocessor_->run(src)) {
-            if (digitizer_->runDigitize(*preprocessor_)) {
-                // 반환 형식이 std::tuple<double, double, double>인 경우 예시
-                // auto [raw_x, raw_y, raw_angle] = ba_->getPos(digitizer_->digitizied_array, digitizer_->movementIndex);
-                auto coords = ba_->getPos(digitizer_->digitizied_array, digitizer_->movementIndex);
+        cv::resize(src, src, {}, 0.5, 0.5);                  // 1280x720 -> 640x360 (처리 속도 개선)
+        static int success_count = 0;
+        static int failed_count = 0;
+        // 1, 이미지 전처리
+        if (!preprocessor_->run(src)) {
+        #ifdef DECODER_DEBUG_MODE
 
-                int    raw_x     = coords.first;
-                int    raw_y     = coords.second;
-                double raw_angle = preprocessor_->camera_up_angle_;
-
-                if (raw_x != -1 && raw_y != -1) {
-                    // [수정] L-Code 좌표 (550×550, 좌상단 원점) -> ROS 좌표 (우상향 X, 상향 Y)
-                    // 1. 중심 이동: (275, 275) -> (0, 0)
-                    // double centered_x = raw_x - 275.0;
-                    // double centered_y = raw_y - 275.0;
-
-                    static const double HALF_SIZE = 550.0 * 0.002 / 2.0;
-
-                    // 2. 좌표계 회전: L-Code(→X, ↓Y) -> ROS(→X, ↑Y)
-                    // L-Code의 Y축이 아래쪽이므로 반전 필요
-                    double ros_x = raw_x * 0.002 - HALF_SIZE;           // -0.55 ~ +0.55
-                    double ros_y = (550 - raw_y) * 0.002 - HALF_SIZE;   // -0.55 ~ +0.55
-
-                    // 2. 방향(Heading) 계산 (L-Code에서 준 angle 반영);
-                    // last_th = raw_angle;
-                    // L-Code 기준 각도를 ROS 라디안 단위로 변환이 필요할 수 있습니다.
-                    // caemra_up_angle_ -> cv의 y,x좌표계 반영 ( 0도 부근에서 +, - 교차함)
-                    double ros_angle_rad = -raw_angle * (M_PI / 180.0);
-                    ros_angle_rad        = std::atan2(std::sin(ros_angle_rad), std::cos(ros_angle_rad));
-
-                    last_x  = ros_x;
-                    last_y  = ros_y;
-                    last_th = ros_angle_rad;
-
-                    initial_pos_found = true;
-                    RCLCPP_INFO(this->get_logger(), "L-Code 해독 성공  x: %d, y: %d, angle: %.1f°", raw_x, raw_y, raw_angle);
-                    RCLCPP_INFO(this->get_logger(), "map 좌표  x: %.3f m, y: %.3f m, angle: %.3f rad (%.1f°)", ros_x, ros_y, ros_angle_rad, -ros_angle_rad * 180.0 / M_PI);
-
-                    publish_all(last_x, last_y, last_th, this->get_clock()->now());
-                } else {
-                    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "L-Code 해독 실패: 유효한 좌표를 얻지 못함");
-                }
-            } else {
-                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "L-Code 해독 실패: digitizer 처리 실패");
-            }
-        } else {
+            cv::imwrite("./resize_images/failed/" + std::to_string(failed_count++) + ".jpg", src); // 디버깅용 실패 이미지 저장
+        #endif
             RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "L-Code 해독 실패: preprocessor 처리 실패 (마커 미발견 등)");
+            return;
         }
 
-        // [중요] 일정한 주기로 TF를 계속 퍼블리시하기 위해 타이머를 사용하므로
-        // 여기 있던 퍼블리시 코드는 제거했습니다.
+        // 2. 디지타이징
+        if (!digitizer_->runDigitize(*preprocessor_)) {
+        #ifdef DECODER_DEBUG_MODE
+            cv::imwrite("./resize_images/failed/" + std::to_string(failed_count++) + ".jpg", src); // 디버깅용 실패 이미지 저장
+        #endif
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "L-Code 해독 실패: digitizer 처리 실패");
+            return;
+        }
+
+        // 3. L-Code에서 좌표와 각도 추출
+        double raw_angle    = preprocessor_->camera_up_angle_;
+        auto [raw_x, raw_y] = ba_->getPos(digitizer_->digitizied_array, digitizer_->movementIndex);
+        if (raw_x == -1 || raw_y == -1) {
+        #ifdef DECODER_DEBUG_MODE
+            cv::imwrite("./resize_images/failed/" + std::to_string(failed_count++) + ".jpg", src); // 디버깅용 실패 이미지 저장
+        #endif
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "L-Code 해독 실패: 유효한 좌표를 얻지 못함");
+            return;
+        }
+        #ifdef DECODER_DEBUG_MODE
+        cv::imwrite("./resize_images/success/" + std::to_string(success_count++) + ".jpg", src); // 디버깅용 성공 이미지 저장
+        #endif
+        // 4. 방향(Heading) 계산 (L-Code에서 준 angle 반영);
+        // last_th = raw_angle;
+        // L-Code 기준 각도를 ROS 라디안 단위로 변환이 필요할 수 있음
+        // caemra_up_angle_ -> cv의 y,x좌표계 반영 ( 0도 부근에서 +, - 교차함)
+        double ros_angle_rad = -raw_angle * (M_PI / 180.0);
+        ros_angle_rad        = std::atan2(std::sin(ros_angle_rad), std::cos(ros_angle_rad));
+
+        // 5. 최종 좌표 변환: L-Code 좌표 (550×550, 좌상단 원점) -> ROS 좌표 (우상향 X, 상향 Y)
+
+        // 로봇 위치 중앙 이동 보정
+        static const double HALF_SIZE = 550.0 * 0.002 / 2.0;
+        double              ros_x     = raw_x * 0.002 - HALF_SIZE;         // -0.55 ~ +0.55
+        double              ros_y     = (550 - raw_y) * 0.002 - HALF_SIZE; // -0.55 ~ +0.55
+
+        last_x  = ros_x;
+        last_y  = ros_y;
+        last_th = ros_angle_rad;
+
+        initial_pos_found = true;
+        RCLCPP_INFO(this->get_logger(), "L-Code 해독 성공  x: %d, y: %d, angle: %.1f°", raw_x, raw_y, raw_angle);
+        RCLCPP_INFO(this->get_logger(), "map 좌표  x: %.3f m, y: %.3f m, angle: %.3f rad (%.1f°)", ros_x, ros_y, ros_angle_rad, -ros_angle_rad * 180.0 / M_PI);
+
+        // 5. 좌표와 방향을 퍼블리시 (TF 발행은 타이머에서 고정 주기로 계속 발행되도록 함)
+        publish_all(last_x, last_y, last_th, this->get_clock()->now());
     }
 
     void publish_all(double map_x, double map_y, double map_th, const rclcpp::Time &stamp)

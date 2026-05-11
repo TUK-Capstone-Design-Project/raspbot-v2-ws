@@ -1,6 +1,7 @@
 #pragma once
 
 // I/O
+#include <format>
 #include <iostream>
 
 // STL
@@ -236,7 +237,7 @@ private:
    * @details detected_all_dots에서 imgs_center_point 기준, 가장 가까운 점을 \n
    * closest_dot_to_cross_point 할당.
    */
-  void findClosestDotToCP();
+  auto findClosestDotToCP() -> bool;
 
   /**
    * @brief closest_dot_to_image_center을 기준, 라인 정렬

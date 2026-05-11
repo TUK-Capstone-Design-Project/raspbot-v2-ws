@@ -49,7 +49,7 @@ DEV_METADATA=$(cat << EOF | tr -d '\n' | tr -s ' '
 [
   {
     "remoteUser": "${USER_NAME}",
-    "workspaceFolder": "/home/${USER_NAME}/workspace",
+    "workspaceFolder": "${WORKSPACE_DIR}",
     "customizations": {
       "vscode": {
         "extensions": [ ${VSCODE_EXTENSIONS} ]
@@ -77,8 +77,8 @@ $DOCKER_CMD run -dt \
     -v /home/pi/temp:/root/temp \
     -v /dev:/dev \
     -v /run/udev:/run/udev:ro \
-    -v "$PROJECT_DIR:/home/$USER_NAME/workspace$VOL_OPTS" \
-    -w /home/$USER_NAME/workspace \
+    -v "$PROJECT_DIR:${WORKSPACE_DIR}$VOL_OPTS" \
+    -w ${WORKSPACE_DIR} \
     $GPU_OPTS \
     $EXTRA_OPTS \
     $IMAGE_NAME:$IMAGE_TAG

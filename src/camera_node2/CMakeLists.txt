@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 4.0)
-project(camera_node)
+project(camera_node2)
 
 set(CMAKE_CXX_STANDARD 23)
 
@@ -30,13 +30,13 @@ find_package(ament_cmake REQUIRED)
 # further dependencies manually.
 # find_package(<dependency> REQUIRED)
 
-add_executable(camera_node)
+add_executable(camera_node2)
 
-target_sources(camera_node PRIVATE
+target_sources(camera_node2 PRIVATE
   src/main.cpp
 )
 
-ament_target_dependencies(camera_node
+ament_target_dependencies(camera_node2
   rclcpp
   geometry_msgs
   nav_msgs
@@ -49,19 +49,19 @@ ament_target_dependencies(camera_node
 )
 
 # 2. GStreamer 헤더 파일 경로 추가
-target_include_directories(camera_node PRIVATE
+target_include_directories(camera_node2 PRIVATE
   ${GST_INCLUDE_DIRS}
 )
 
 # 3. GStreamer 라이브러리 링크 추가
-target_link_libraries(camera_node
+target_link_libraries(camera_node2
   ${GST_LIBRARIES}
   ${OpenCV_LIBRARIES}
 )
 
 # 4. GStreamer 컴파일/링크 디렉토리 플래그 추가 (옵션이지만 권장)
-target_compile_options(camera_node PRIVATE ${GST_CFLAGS})
-target_link_directories(camera_node PRIVATE ${GST_LIBRARY_DIRS})
+target_compile_options(camera_node2 PRIVATE ${GST_CFLAGS})
+target_link_directories(camera_node2 PRIVATE ${GST_LIBRARY_DIRS})
 
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
@@ -78,7 +78,7 @@ endif()
 ament_package()
 
 install(TARGETS
-  camera_node
+  camera_node2
   DESTINATION lib/${PROJECT_NAME}
 )
 

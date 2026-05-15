@@ -59,9 +59,9 @@ bool KinematicsInterface::is_connected() const { return (fd_ >= 0) || is_simulat
 
 void KinematicsInterface::stop() { drive(0.0, 0.0, 0.0); }
 
-void KinematicsInterface::set_motor(int id, int speed) {
+int KinematicsInterface::set_motor(int id, int speed) {
   if (fd_ < 0)
-    return;
+    return 0;
 
   // ── 데드밴드 + 최소시동 PWM 보정 ──────────────────────────────────────
   int abs_in = std::abs(speed);
@@ -89,6 +89,8 @@ void KinematicsInterface::set_motor(int id, int speed) {
 
   // RPi 5 및 I2C 버스 안정화를 위한 미세 지연
   std::this_thread::sleep_for(std::chrono::microseconds(500));
+
+  return out;
 }
 
 void KinematicsInterface::drive(double vx, double vy, double wz) {
@@ -99,11 +101,18 @@ void KinematicsInterface::drive(double vx, double vy, double wz) {
     msg.linear.y = vy;
     msg.angular.z = wz;
     sim_pub_->publish(msg);
+    effective_vx_ = vx;
+    effective_vy_ = vy;
+    effective_wz_ = wz;
     return;
   }
 
-  if (fd_ < 0)
+  if (fd_ < 0) {
+    effective_vx_ = 0.0;
+    effective_vy_ = 0.0;
+    effective_wz_ = 0.0;
     return;
+  }
 
   // [메카넘 휠 역기구학 공식]
   // K = L + W (회전 계수)
@@ -112,9 +121,35 @@ void KinematicsInterface::drive(double vx, double vy, double wz) {
   double rl = vx + vy - (K_ * wz);
   double rr = vx - vy + (K_ * wz);
 
-  // 물리 속도(m/s)를 모터 드라이버 PWM 값으로 스케일링하여 전송
-  set_motor(0, static_cast<int>(std::round(fl * speed_scale_)));
-  set_motor(1, static_cast<int>(std::round(fr * speed_scale_)));
-  set_motor(2, static_cast<int>(std::round(rl * speed_scale_)));
-  set_motor(3, static_cast<int>(std::round(rr * speed_scale_)));
+  // 명령 PWM (round 적용)
+  int p_fl_cmd = static_cast<int>(std::round(fl * speed_scale_));
+  int p_fr_cmd = static_cast<int>(std::round(fr * speed_scale_));
+  int p_rl_cmd = static_cast<int>(std::round(rl * speed_scale_));
+  int p_rr_cmd = static_cast<int>(std::round(rr * speed_scale_));
+
+  // 실제로 모터에 들어간 PWM (clamp/deadband/min_pwm 보정 후)
+  // ID 매핑: 0=FL, 1=RL, 2=FR, 3=RR
+  int p_fl = set_motor(0, p_fl_cmd);
+  int p_rl = set_motor(1, p_rl_cmd);
+  int p_fr = set_motor(2, p_fr_cmd);
+  int p_rr = set_motor(3, p_rr_cmd);
+
+  // PWM → 휠 선속도(m/s) 역산. speed_scale 자체의 비선형성은 못 잡지만,
+  // 적어도 deadband/min_pwm 보정으로 인한 양자화는 정직하게 반영됨.
+  const double inv_scale = (speed_scale_ != 0.0) ? (1.0 / speed_scale_) : 0.0;
+  double wfl = p_fl * inv_scale;
+  double wfr = p_fr * inv_scale;
+  double wrl = p_rl * inv_scale;
+  double wrr = p_rr * inv_scale;
+
+  // 메카넘 정기구학: 휠 속도 → 로봇 좌표계 속도
+  effective_vx_ = ( wfl + wfr + wrl + wrr) / 4.0;
+  effective_vy_ = (-wfl + wfr + wrl - wrr) / 4.0;
+  effective_wz_ = (-wfl + wfr - wrl + wrr) / (4.0 * K_);
+}
+
+void KinematicsInterface::get_effective_velocity(double &vx, double &vy, double &wz) const {
+  vx = effective_vx_;
+  vy = effective_vy_;
+  wz = effective_wz_;
 }

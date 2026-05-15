@@ -33,10 +33,12 @@ private:
   const double W_ = 0.15;
   const double K_ = L_ + W_; // 회전 계수
 
-  // 옴니바퀴 미끄러짐 보정용 마지막 명령 저장
-  double last_vx_ = 0.0;
-  double last_vy_ = 0.0;
-  double last_wz_ = 0.0;
+  // drive() 호출 시 모터에 *실제로 들어간* PWM (clamp/deadband 통과 후) 기반으로
+  // 메카넘 정기구학으로 역산한 로봇 좌표계 effective 속도.
+  // odom 적분은 명령값(vx/vy/wz)이 아니라 이 값을 써야 거짓말이 줄어듦.
+  double effective_vx_ = 0.0;
+  double effective_vy_ = 0.0;
+  double effective_wz_ = 0.0;
 
 public:
   // ── 모터 튜닝 파라미터 (ROS param 으로 주입; 런타임 조정 가능) ─────────
@@ -48,7 +50,7 @@ public:
 
   // 0 < |PWM| < min_pwm_ 인 경우 부호를 유지한 채 ±min_pwm_ 로 끌어올림
   // → DC 모터의 정지 마찰을 이기는 최소 시동 전압 보상
-  int min_pwm_ = 80;
+  int min_pwm_ = 5;
 
   // 상한 (드라이버 보호)
   int max_pwm_ = 255;
@@ -75,9 +77,17 @@ public:
   /**
    * @brief 개별 모터 제어 (Low-level)
    * @param id 모터 ID (0~3)
-   * @param speed 모터 속도 (-255 FF~ 255)
+   * @param speed 모터 속도 (-255 ~ 255)
+   * @return clamp/deadband/min_pwm 보정 후 *실제로 모터에 들어간* PWM 값.
+   *         odom 적분에서 실효 속도 역산에 사용.
    */
-  void set_motor(int id, int speed);
+  int set_motor(int id, int speed);
+
+  /**
+   * @brief 마지막 drive() 호출에서 clamp 후 실제로 적용된 effective 속도 조회.
+   *        cmd_vel(명령)이 아니라 모터에 진짜로 박힌 PWM 기반이므로 odom 적분 용도.
+   */
+  void get_effective_velocity(double &vx, double &vy, double &wz) const;
 
   /**
    * @brief Nav2/ROS 2 표준 속도 명령 인터페이스 (High-level)

@@ -38,24 +38,30 @@ controller_server:
       free_goal_velocity: False
 
     FollowPath:
-      plugin: "nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController"
-      desired_linear_vel: 0.6                  # 주행 속도 최대 수준으로 상향
+      plugin: "nav2_rotation_shim_controller::RotationShimController"
+      angular_dist_threshold: 0.15      # 이 각도(rad, ~8.6도) 이상이면 제자리 회전 먼저
+      forward_sampling_distance: 0.5
+      rotate_to_heading_angular_vel: 2.0
+      max_angular_accel: 2.0
+      simulate_ahead_time: 1.0
+      primary_controller: "nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController"
+      desired_linear_vel: 0.6
       lookahead_dist: 0.15
       min_lookahead_dist: 0.08
-      max_lookahead_dist: 0.4
+      max_lookahead_dist: 0.25          # 짧게 줄여 경로를 더 정확히 추종
       lookahead_time: 1.5
       use_velocity_scaled_lookahead_dist: true
-      min_approach_linear_velocity: 0.3        # 최소 작동 속도 대폭 상향 보정
+      min_approach_linear_velocity: 0.3
       max_allowed_time_to_collision_up_to_carrot: 1.5
       use_regulated_linear_velocity_scaling: true
       use_cost_regulated_linear_velocity_scaling: false
       regulated_linear_scaling_min_radius: 0.3
-      regulated_linear_scaling_min_speed: 0.3   # 감속 시 최소 속도 상향 보정
+      regulated_linear_scaling_min_speed: 0.3
       allow_reversing: false
       max_angular_accel: 2.0
       max_robot_pose_search_dist: 10.0
       transform_tolerance: 0.5
-      rotate_to_heading_angular_vel: 2.0       # 1.5 → 2.0 (회전도 빠르게)
+      rotate_to_heading_angular_vel: 2.0
       rotate_to_heading_min_angle: 0.15
       use_rotate_to_heading: true
 
@@ -79,7 +85,7 @@ local_costmap:
       transform_tolerance: 0.5
       update_frequency: 5.0
       publish_frequency: 2.0
-      global_frame: map
+      global_frame: odom
       robot_base_frame: base_link
       use_sim_time: False
       rolling_window: true

@@ -1,6 +1,7 @@
 #include "ImgPreprocessor/ImgPreprocessor.hpp"
 #include "Common/Line.h"
 #include "ConfigSettings/ConfigSettings.hpp"
+#include <opencv2/core/types.hpp>
 #include <opencv2/highgui.hpp>
 #include <opencv2/ximgproc.hpp>
 using namespace std;
@@ -127,21 +128,62 @@ auto ImgPreprocessor::findClosestDotToCP() -> bool {
 }
 
 void ImgPreprocessor::orderBaseLinesByClosestDot() {
-  std::vector<std::pair<double, std::vector<Line<int>>>> line_to_dot_distances; // CenterDot 거리와 해당 라인을 묶음
+  // 점과 선분 사이 거리 , 해당 선분을 묶어 저장
+  std::vector<std::pair<std::vector<Line<int>>, double>> line_to_dot_distances;
   for (const auto &cluster : clustered_lines) {
     for (const auto &line : cluster) {
       double dist = distanceFromPointToLine(closest_dot_to_cross_point.pt, line.pt1, line.pt2);
-      line_to_dot_distances.push_back({dist, cluster});
+      line_to_dot_distances.push_back({cluster, dist});
     }
   }
+
+  // 거리 기준으로 선들을 오름차순 정렬
   sort(line_to_dot_distances.begin(), line_to_dot_distances.end(),
-       [](const pair<double, vector<Line<int>>> &a, const pair<double, vector<Line<int>>> &b) {
-         return a.first < b.first;
+       [](const pair<std::vector<Line<int>>, double> &a, const pair<std::vector<Line<int>>, double> &b) {
+         return a.second < b.second;
        });
 
   for (int i = 0; i < line_to_dot_distances.size(); i++) {
-    this->closestLines.push_back(line_to_dot_distances[i].second);
+    this->closestLines.push_back(line_to_dot_distances[i].first);
   }
+
+  if (this->closestLines.size() >= 2) {
+    auto get_side_vec = [&](const std::vector<Line<int>> &cluster) {
+      // 선의 중심점과 점(Dot) 사이의 벡터 반환
+      cv::Point2f center((cluster[0].pt1.x + cluster[0].pt2.x) / 2.0f, (cluster[0].pt1.y + cluster[0].pt2.y) / 2.0f);
+      return center - closest_dot_to_cross_point.pt;
+    };
+
+    // 두번째, 세번째 선이 같은 방향 벡터면 , [0]으로 할당된 선분을 [1]과 교체함
+    // [0]으로 할당되는 선은 중앙에 있는 선분이 되어야하기 때문
+    auto vec_1 = get_side_vec(this->closestLines[1]);
+    auto vec_2 = get_side_vec(this->closestLines[2]);
+
+    float dot_product = vec_1.x * vec_2.x + vec_1.y * vec_2.y;
+
+    if (dot_product > 0) {
+      std::swap(this->closestLines[0], this->closestLines[1]);
+    }
+  }
+#ifdef SHOW_VIDEO
+  cv::Mat    temp_src = this->src.clone();
+  cv::Scalar color(255, 0, 0);  // 제일가까운
+  cv::Scalar color2(0, 255, 0); // 두번째로 가까운
+  cv::Scalar color3(0, 0, 255); // 세번째로 가까운
+  for (int i = 0; i < closestLines.size(); i++) {
+    for (const auto &line : closestLines[i]) {
+      if (i == 0) {
+        cv::line(temp_src, line.pt1, line.pt2, color, 2);
+      } else if (i == 1) {
+        cv::line(temp_src, line.pt1, line.pt2, color2, 2);
+      } else if (i == 2) {
+        cv::line(temp_src, line.pt1, line.pt2, color3, 2);
+      }
+    }
+  }
+  imshow("orderBaseLinesByClosestDot", temp_src);
+  waitKey(0);
+#endif
 }
 
 auto ImgPreprocessor::distanceFromPointToLine(cv::Point pt, cv::Point lineStart, cv::Point lineEnd) -> double {
@@ -1161,7 +1203,64 @@ auto ImgPreprocessor::checkAndCorrectOrientation() -> bool {
 //     return false;
 //   }
 //   return true;
-// }
+// }#include <opencv2/opencv.hpp>
+#include <algorithm>
+#include <vector>
+
+/**
+ * @brief 이미지에서 원형에 가까운 '점'만 추출하는 함수
+ * * @param src 입력 이미지 (cv::Mat)
+ * @param minArea 점으로 인정할 최소 면적 (노이즈 제거용, 기본값 5.0)
+ * @param maxAspectRatio 점으로 인정할 최대 종횡비 (1에 가까울수록 완벽한 원, 기본값 1.5)
+ * @return cv::Mat 점만 남은 결과 이미지
+ */
+cv::Mat extractDots(const cv::Mat &src, double minArea = 5.0, double maxAspectRatio = 1.5) {
+  // 1. 입력 이미지가 3채널(컬러)인 경우 1채널(그레이스케일)로 변환
+  cv::Mat gray;
+  if (src.channels() == 3) {
+    cv::cvtColor(src, gray, cv::COLOR_BGR2GRAY);
+  } else {
+    gray = src.clone();
+  }
+
+  // 2. 이진화 (배경은 검게, 객체는 하얗게)
+  cv::Mat binary;
+  cv::threshold(gray, binary, 0, 255, cv::THRESH_BINARY_INV | cv::THRESH_OTSU);
+
+  // 3. 외곽선(Contour) 찾기
+  std::vector<std::vector<cv::Point>> contours;
+  cv::findContours(binary, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+
+  // 4. 점만 그릴 빈 캔버스 (검은 바탕) 생성
+  cv::Mat result = cv::Mat::zeros(gray.size(), CV_8UC1);
+
+  // 5. 조건에 맞는 외곽선 필터링 및 그리기
+  for (size_t i = 0; i < contours.size(); i++) {
+    double          area    = cv::contourArea(contours[i]);
+    cv::RotatedRect rotRect = cv::minAreaRect(contours[i]);
+
+    double width  = rotRect.size.width;
+    double height = rotRect.size.height;
+
+    // 크기가 0인 예외 상황 방지
+    if (width == 0 || height == 0)
+      continue;
+
+    // 종횡비 계산 (긴 변 / 짧은 변)
+    double aspectRatio = std::max(width, height) / std::min(width, height);
+
+    // 노이즈(면적)와 선(종횡비)을 제외하고 점만 통과
+    if (area > minArea && aspectRatio < maxAspectRatio) {
+      cv::drawContours(result, contours, (int)i, cv::Scalar(255), cv::FILLED);
+    }
+  }
+
+  // 6. 원본처럼 흰 배경에 검은 점으로 보이도록 반전
+  cv::Mat finalResult;
+  cv::bitwise_not(result, finalResult);
+
+  return finalResult;
+}
 Mat normalizeIllumination(Mat src) {
   Mat gray;
   if (src.channels() == 3)
@@ -1186,6 +1285,23 @@ Mat normalizeIllumination(Mat src) {
 
   return result;
 }
+cv::Mat applyGrayMaskOverlay(const cv::Mat &src, const cv::Mat &mask, int intensity, double alpha = 0.5) {
+  cv::Mat dst = src.clone();
+
+  // 1. 마스크 반전 (0 -> 255, 255 -> 0)
+  cv::Mat invMask;
+  cv::bitwise_not(mask, invMask);
+
+  // 2. 덮어씌울 색상 레이어 생성 및 합성
+  cv::Mat grayLayer = cv::Mat::ones(src.size(), src.type()) * intensity;
+  cv::Mat blended;
+  cv::addWeighted(src, 1.0 - alpha, grayLayer, alpha, 0, blended);
+
+  // 3. 반전된 마스크를 이용하여 0이었던 영역에만 blended 복사
+  blended.copyTo(dst, invMask);
+
+  return dst;
+}
 auto ImgPreprocessor::run(cv::Mat source) -> bool {
   // 이미지 없음
   if (source.empty()) {
@@ -1207,10 +1323,17 @@ auto ImgPreprocessor::run(cv::Mat source) -> bool {
   cv::waitKey(0);
 #endif
 
+  cv::Mat test = extractDots(this->gray);
   // 2. Dot 검출기 생성 및 점 검출
   DotDetector dotDetector;
   dotDetector.setupParameters(params_);
-  dotDetector.detectBySimpleBlobDetector(this->gray, all_detected_dots_);
+  // dotDetector.detectBySimpleBlobDetector(this->gray, all_detected_dots_);
+  cv::Mat applied_img = test = applyGrayMaskOverlay(gray, test, 0, 1);
+
+  // imshow("applied_img", applied_img);
+  // waitKey(0);
+
+  dotDetector.detectBySimpleBlobDetector(applied_img, all_detected_dots_);
 
   // 검출된 점 그리기 (디버깅용)
   drawDetectedDots(this->src, all_detected_dots_);
@@ -1219,6 +1342,8 @@ auto ImgPreprocessor::run(cv::Mat source) -> bool {
     LBS_error_code = SBD_error;
     return false;
   }
+  // imshow("test", test);
+  // waitKey(0);
 
   // 3. 이미지 이진화, adatptive thresholding 적용
   this->binarizeImage();
@@ -1242,13 +1367,19 @@ auto ImgPreprocessor::run(cv::Mat source) -> bool {
     cv::circle(src, closest_dot_to_cross_point.pt, 5, cv::Scalar(255, 20, 5), -1);
   }
 
+  // 이미지 중앙에서 가장 가까운점을 기준으로 선분을 정렬
   this->orderBaseLinesByClosestDot();
 
+  //
+
   this->findValidLinesByDotsLocation();
+
   if (!this->findValidLinesByDotsNum()) {
     LBS_error_code = findValidLines_error;
     return false;
   }
+
+  //////////
 
   if (!this->validateClosestBaseLinesByDirection()) {
     this->LBS_error_code = validateClosestBaseLines_error;

@@ -34,7 +34,7 @@ auto LineProcessor::detectBaseLines(cv::Mat &img) -> bool {
 
     // 클러스터된 선의 갯수가 타겟 갯수 내애 들어오지 않으면 최대 n번 반복
     if (!validateClusterSize()) {
-      // std::cout << "Cluster size not valid : " << clustered_lines.size() << "\n";
+      std::cout << "Cluster size not valid : " << clustered_lines.size() << "\n";
       continue;
     }
     std::vector<Line<int>> candidateLines;
@@ -290,7 +290,7 @@ auto LineProcessor::clusterLines(bool &cluster_valid_check, std::vector<Line<int
 
   // 클러스터된 선의 갯수가 타겟 갯수 내애 들어오지 않으면 최대 n번 반복
   if (!validateClusterSize()) {
-    // std::cout << "Cluster size not valid : " << clustered_lines.size() << "\n";
+    std::cout << "Cluster size not valid : " << clustered_lines.size() << "\n";
     return false;
   }
 
@@ -316,7 +316,7 @@ auto LineProcessor::clusterLines(bool &cluster_valid_check, std::vector<Line<int
 auto LineProcessor::doHoughLines(cv::Mat &src, std::vector<cv::Vec2f> &detected_polar_lines) -> bool {
   // 허프라인의 오류 발생시 return;
   try {
-    cv::HoughLines(src, detected_polar_lines, this->Hough_rho_, CV_PI / 180, 100);
+    cv::HoughLines(src, detected_polar_lines, this->Hough_rho_, CV_PI / 180, 80);
   } catch (...) { return false; }
   return true;
 }

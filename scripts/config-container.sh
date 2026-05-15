@@ -5,7 +5,7 @@ PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # 이미지 및 컨테이너 이름 설정
 IMAGE_NAME="raspbot-v2-sdk"
-IMAGE_TAG="26.5.9"
+IMAGE_TAG="26.5.14"
 CONTAINER_NAME="raspbot-v2"
 
 # 원격 설정 (Docker Hub 또는 개인 레지스트리)

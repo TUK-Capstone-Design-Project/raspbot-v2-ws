@@ -8,7 +8,7 @@ DriverNode::DriverNode() : Node("driver_node"), x_(0.0), y_(0.0), th_(0.0), vx_(
   // PWM = round(wheel_speed_m_per_s * speed_scale)
   this->declare_parameter<double>("speed_scale", 40.0);
   // 0 < |PWM| < min_pwm 인 경우 ±min_pwm 으로 끌어올려 정지마찰 보상
-  this->declare_parameter<int>("min_pwm", 60);
+  this->declare_parameter<int>("min_pwm", 15);
   // |PWM| < pwm_deadzone 이면 0 으로 무시 (지터 방지)
   this->declare_parameter<int>("pwm_deadzone", 5);
   this->declare_parameter<int>("max_pwm", 255);
@@ -78,13 +78,20 @@ void DriverNode::update_odometry() {
   last_odom_time_ = now;
 
   // 1. 추측 항법(Dead Reckoning) 계산
-  // 로봇 좌표계 속도를 세계 좌표계(odom)로 변환하여 적분
-  double delta_x = (vx_ * cos(th_) - vy_ * sin(th_)) * dt;
-  double delta_y = (vx_ * sin(th_) + vy_ * cos(th_)) * dt;
-  double delta_th = wz_ * dt;
+  //    nav2가 보낸 명령(vx_)이 아니라, KinematicsInterface 내부에서
+  //    deadband/min_pwm/max_pwm 보정을 거친 후 *실제로 모터에 들어간 PWM*을
+  //    기반으로 메카넘 정기구학으로 역산한 effective 속도를 적분한다.
+  //    → cmd_vel은 0.1 m/s인데 PWM이 min_pwm(예: 10)으로 끌어올려져 실제로는
+  //      더 빠르게 움직이는 경우 등의 거짓말이 odom에 반영됨.
+  double eff_vx, eff_vy, eff_wz;
+  robot_->get_effective_velocity(eff_vx, eff_vy, eff_wz);
 
-  x_ += delta_x;
-  y_ += delta_y;
+  double delta_x  = (eff_vx * cos(th_) - eff_vy * sin(th_)) * dt;
+  double delta_y  = (eff_vx * sin(th_) + eff_vy * cos(th_)) * dt;
+  double delta_th = eff_wz * dt;
+
+  x_  += delta_x;
+  y_  += delta_y;
   th_ += delta_th;
 
   // 2. TF 발행 (odom -> base_link)
@@ -112,16 +119,25 @@ void DriverNode::update_odometry() {
   odom.pose.pose.position.y = y_;
   odom.pose.pose.orientation = t.transform.rotation;
 
-  // 추가한 부분 
-  odom.twist.twist.linear.x = vx_;
-  odom.twist.twist.linear.y = vy_;
-  odom.twist.twist.angular.z = wz_;
-  odom.twist.covariance = {0.01, 0.0, 0.0, 0.0, 0.0, 0.0,
-                          0.0, 0.01, 0.0, 0.0, 0.0, 0.0,
-                          0.0, 0.0, 0.01, 0.0, 0.0, 0.0,
-                          0.0, 0.0, 0.0, 0.01, 0.0, 0.0,
-                          0.0, 0.0, 0.0, 0.0, 0.01, 0.0,
-                          0.0, 0.0, 0.0, 0.0, 0.0, 0.01};
+  // twist도 명령값(vx_/vy_/wz_)이 아니라 effective 값을 publish해야
+  // 컨트롤러/EKF에서 일관된 속도를 보게 됨.
+  odom.twist.twist.linear.x  = eff_vx;
+  odom.twist.twist.linear.y  = eff_vy;
+  odom.twist.twist.angular.z = eff_wz;
+
+  // 2D 차동/메카넘 로봇: z, roll, pitch는 모르므로 매우 큰 분산으로 무시 신호.
+  odom.pose.covariance = {1e-3, 0,    0,    0,    0,    0,
+                          0,    1e-3, 0,    0,    0,    0,
+                          0,    0,    1e6,  0,    0,    0,
+                          0,    0,    0,    1e6,  0,    0,
+                          0,    0,    0,    0,    1e6,  0,
+                          0,    0,    0,    0,    0,    1e-2};
+  odom.twist.covariance = {1e-3, 0,    0,    0,    0,    0,
+                           0,    1e-3, 0,    0,    0,    0,
+                           0,    0,    1e6,  0,    0,    0,
+                           0,    0,    0,    1e6,  0,    0,
+                           0,    0,    0,    0,    1e6,  0,
+                           0,    0,    0,    0,    0,    1e-2};
   odom_publisher_->publish(odom);
 }
 

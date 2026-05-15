@@ -1,40 +1,32 @@
-#include <opencv2/opencv.hpp>
-#include <print>
+#include <filesystem>
 #include <format>
 #include <memory>
+#include <opencv2/opencv.hpp>
+#include <print>
 #include <string_view>
 #include <vector>
-#include <filesystem>
 
+#include "cv_bridge/cv_bridge.h"
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/image.hpp"
-#include "cv_bridge/cv_bridge.h"
+#include "image_transport/image_transport.hpp"
 
-int main(int argc, char *argv[]) {
+int main(int argc, char *argv[])
+{
     // ROS 2 초기화
     rclcpp::init(argc, argv);
     auto node = rclcpp::Node::make_shared("camera_node");
-    auto qos = rclcpp::SensorDataQoS().keep_last(1);
-    auto image_pub = node->create_publisher<sensor_msgs::msg::Image>("/downward_camera/image_raw", qos);
 
-    // OV9281은 mono 카메라이므로 GRAY8 포맷을 명시해 협상 실패를 방지한다.
-    // appsink 의 drop=1, max-buffers=1, sync=false 는 라이브 소스에서 백프레셔를 끊어
-    // cap.read() 가 영구 블록되는 현상을 막는다.
-    // videobalance의 brightness 값을 통해 밝기를 조절합니다 (-1.0 ~ 1.0, 기본값: 0.0)
-    // 노출(Gain/대비)을 높이기 위해 contrast 값을 추가로 늘립니다 (기본값: 1.0)
-    std::string pipeline_str = "libcamerasrc ! video/x-raw,width=1280,height=720,framerate=120/1 ! videoconvert ! videobalance brightness=0.1 contrast=1.5 ! appsink";
-    // std::string pipeline_str =
-    //     "libcamerasrc ! "
-    //     "video/x-raw,format=GRAY8,width=1280,height=720,framerate=60/1 ! "
-    //     "appsink drop=1 max-buffers=1 sync=false";
-        
-    std::println("test1: libcamera 파이프라인 로드 시도 중...");
-    
-    // GStreamer 백엔드를 강제 지정하여 엽니다.
+    // 1. image_transport 설정 (압축 기능을 위해 필요)
+    image_transport::ImageTransport it(node);
+    auto                       qos       = rclcpp::SensorDataQoS().keep_last(1);
+    image_transport::Publisher image_pub = it.advertise("/downward_camera/image_raw", qos.get_rmw_qos_profile());
+
+    // 2. GStreamer 파이프라인 문자열 설정
+    // std::string pipeline_str = "libcamerasrc ! video/x-raw,width=1280,height=720,framerate=120/1 ! videoconvert ! videobalance brightness=0.1 contrast=1.5 ! appsink";
+    std::string pipeline_str = "libcamerasrc ! video/x-raw,width=1280,height=720,framerate=120/1 ! videoconvert ! appsink";
+
     cv::VideoCapture cap(pipeline_str, cv::CAP_GSTREAMER);
-    
-    std::println("test2: 로드 완료 (혹은 실패)");
-    
     if (!cap.isOpened()) {
         RCLCPP_ERROR(node->get_logger(), "카메라를 열 수 없습니다. 파이프라인을 확인하세요.");
         rclcpp::shutdown();
@@ -43,10 +35,8 @@ int main(int argc, char *argv[]) {
 
     RCLCPP_INFO(node->get_logger(), "Camera pipeline started via OpenCV(GStreamer). Press Ctrl+C to stop.");
 
-    int frame_count = 0;
+    int     frame_count = 0;
     cv::Mat frame;
-
-    std::filesystem::create_directories("frames"); // 프레임 저장용 디렉토리 생성
 
     while (rclcpp::ok()) {
         // 이미지를 OpenCV 객체(cv::Mat)로 바로 가져옵니다
@@ -72,17 +62,10 @@ int main(int argc, char *argv[]) {
 
         // 인코딩을 "bgr8" 대신 "mono8"로 변경
         sensor_msgs::msg::Image::SharedPtr msg = cv_bridge::CvImage(header, "mono8", gray_frame).toImageMsg();
-        image_pub->publish(*msg);
+        image_pub.publish(*msg);
 
-        // 10 프레임마다 로컬 이미지 저장
-        // if (frame_count % 10 == 0) {
-        //     std::string file_name = std::format("./frames/frame_{}.png", frame_count);
-        //     const std::vector<int> params = {cv::IMWRITE_PNG_COMPRESSION, 9};
-        //     cv::imwrite(file_name, frame, params);
-        // }
-        // cv::imshow("Camera Frame", frame);
         frame_count++;
-        
+
         rclcpp::spin_some(node);
     }
 

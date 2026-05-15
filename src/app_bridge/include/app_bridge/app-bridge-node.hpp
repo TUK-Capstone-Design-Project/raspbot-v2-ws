@@ -55,7 +55,7 @@ private:
     std::function<void(Ptr)>                      on_close_;
 };
 
-// ── 메인 ROS2 노드 ────────────────────────────────────
+// ── 메인 ROS2 노드 ─────────────────────────
 class AppBridgeNode : public rclcpp::Node
 {
 public:

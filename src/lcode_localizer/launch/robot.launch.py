@@ -35,10 +35,10 @@ def generate_launch_description():
     )
 
     # 3. [추가] 실제 카메라 노드 
-    camera_node = Node(
-        package='camera_node',
-        executable='camera_node',
-        name='camera_node',
+    camera_node2 = Node(
+        package='camera_node2',
+        executable='camera_node2',
+        name='camera_node2',
         output='screen',
         parameters=[{'use_sim_time': False}]
     )
@@ -62,19 +62,47 @@ def generate_launch_description():
         parameters=[{'use_sim_time': False}]
     )
 
-    # 6. Nav2 Bringup (use_sim_time: False 반영)
-    nav2_launch = IncludeLaunchDescription(
+    # 6. Nav2 Navigation only (amcl 제외)
+    #    bringup_launch.py 는 내부적으로 localization_launch.py(amcl) 까지 띄워서
+    #    lcode_localizer 와 map->odom TF 가 충돌함. navigation_launch.py 만 사용한다.
+    nav2_navigation_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
-            os.path.join(pkg_nav2, 'launch', 'bringup_launch.py')
+            os.path.join(pkg_nav2, 'launch', 'navigation_launch.py')
         ),
         launch_arguments={
-            'map': map_yaml,
-            'yaml_filename': map_yaml,
-            'use_sim_time': 'False',  # 중요!
+            'use_sim_time': 'False',
             'params_file': nav2_params,
             'autostart': 'True',
-            'use_lifecycle_mgr': 'True'
+            'use_composition': 'False',
         }.items()
+    )
+
+    # 6-1. Map Server (bringup_launch.py 가 아니면 따로 띄워야 함)
+    map_server_node = Node(
+        package='nav2_map_server',
+        executable='map_server',
+        name='map_server',
+        output='screen',
+        parameters=[{
+            'use_sim_time': False,
+            'yaml_filename': map_yaml,
+            'topic_name': 'map',
+            'frame_id': 'map',
+        }]
+    )
+
+    # 6-2. Map Server lifecycle 관리 (navigation_launch.py 쪽 lifecycle_manager 는
+    #      map_server 를 관리하지 않음. 따라서 별도 lifecycle_manager 가 필요)
+    map_lifecycle_manager = Node(
+        package='nav2_lifecycle_manager',
+        executable='lifecycle_manager',
+        name='lifecycle_manager_map',
+        output='screen',
+        parameters=[{
+            'use_sim_time': False,
+            'autostart': True,
+            'node_names': ['map_server'],
+        }]
     )
 
     # 7. App Bridge
@@ -92,9 +120,11 @@ def generate_launch_description():
 
     return LaunchDescription([
         robot_state_publisher,
-        camera_node,
+        camera_node2,
         robot_driver_node,
         localizer_node,
-        nav2_launch,
+        map_server_node,
+        map_lifecycle_manager,
+        nav2_navigation_launch,
         app_bridge_node
     ])

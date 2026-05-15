@@ -3,6 +3,7 @@
 #include <filesystem>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <nav_msgs/msg/odometry.hpp>
+#include <opencv2/core.hpp>
 #include <opencv2/highgui.hpp>
 #include <opencv2/imgproc.hpp>
 #include <rclcpp/rclcpp.hpp>
@@ -20,7 +21,8 @@
 #include "Digitizer/Digitizer.hpp"
 #include "ImgPreprocessor/ImgPreprocessor.hpp"
 
-#define DECODER_DEBUG_MODE
+// #define DECODER_DEBUG_MODE // 디버그 모드 비활성화
+
 class LCodeLocalizerNode : public rclcpp::Node
 {
 public:
@@ -42,12 +44,28 @@ public:
         tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
         // odom_pub_ = this->create_publisher<nav_msgs::msg::Odometry>("/odom", 10);
 
-        // 3. TF 발행용 타이머 (카메라 이미지가 멈춰도 TF 트리가 끊어지지 않도록 고정 주기로 발행)
+        // 캐시 초기값: identity (map == odom). 첫 L-Code 인식 전까지는 이 값이 발행되어
+        // Nav2 가 map 프레임이 없어서 죽는 현상을 막는다.
+        cached_map_to_odom_.header.frame_id = "map";
+        cached_map_to_odom_.child_frame_id  = "odom";
+        cached_map_to_odom_.transform.translation.x = 0.0;
+        cached_map_to_odom_.transform.translation.y = 0.0;
+        cached_map_to_odom_.transform.translation.z = 0.0;
+        cached_map_to_odom_.transform.rotation.x = 0.0;
+        cached_map_to_odom_.transform.rotation.y = 0.0;
+        cached_map_to_odom_.transform.rotation.z = 0.0;
+        cached_map_to_odom_.transform.rotation.w = 1.0;
+
+        // 3. TF 발행용 타이머.
+        // 새 L-Code 인식 결과가 들어왔을 때만 image_callback 에서 cached_map_to_odom_ 가 갱신되고,
+        // 타이머는 절대 새로 계산하지 않고 stamp 만 갈아끼워서 재발행한다.
+        // (이전 구현은 매 50ms 마다 last_x/y/th(=마지막 L-Code 인식 결과)와 *현재* odom 으로
+        //  map→odom 을 다시 계산했기 때문에, map→base_link 가 항상 last_x/y/th 에 고정되어
+        //  Nav2 가 본 로봇은 L-Code 인식이 들어오기 전까진 절대 안 움직이는 것처럼 보였음.)
         tf_timer_ = this->create_wall_timer(
             std::chrono::milliseconds(50), [this]() {
-                if (initial_pos_found) {
-                    publish_all(last_x, last_y, last_th, this->get_clock()->now());
-                }
+                cached_map_to_odom_.header.stamp = this->get_clock()->now();
+                tf_broadcaster_->sendTransform(cached_map_to_odom_);
             }
         );
 
@@ -74,9 +92,11 @@ private:
     std::unique_ptr<tf2_ros::TransformBroadcaster>           tf_broadcaster_;
 
     double last_x = 0.0, last_y = 0.0, last_th = 0.0;
-    // 초기 위치를 못 찾았더라도 일단 (0,0,0)을 기준으로 map->odom을 발행하도록 강제 활성화합니다.
-    // 이렇게 하면 Nav2가 초기에 map 프레임을 찾지 못해 죽는 현상을 방지할 수 있습니다.
-    bool initial_pos_found = true;
+
+    // 마지막으로 계산한 map→odom. 새 L-Code 인식이 들어와 publish_all() 이 호출될 때만 갱신되고,
+    // 타이머는 stamp 만 갈아끼워서 이걸 그대로 재발행한다. 그 결과 인식 사이엔 map→odom 이
+    // 고정되고 odom 의 증분이 그대로 map→base_link 에 반영되어 Nav2 가 로봇 움직임을 실제로 본다.
+    geometry_msgs::msg::TransformStamped cached_map_to_odom_;
 
     void image_callback(const sensor_msgs::msg::Image::SharedPtr msg)
     {
@@ -94,6 +114,7 @@ private:
         RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "이미지 콜백 호출됨 - 프레임 수신 중");
 
         cv::resize(src, src, {}, 0.5, 0.5);                  // 1280x720 -> 640x360 (처리 속도 개선)
+        cv::rotate(src, src, cv::ROTATE_90_CLOCKWISE);
         static int success_count = 0;
         static int failed_count = 0;
         // 1, 이미지 전처리
@@ -129,11 +150,25 @@ private:
         cv::imwrite("./resize_images/success/" + std::to_string(success_count++) + ".jpg", src); // 디버깅용 성공 이미지 저장
         #endif
         // 4. 방향(Heading) 계산 (L-Code에서 준 angle 반영);
-        // last_th = raw_angle;
-        // L-Code 기준 각도를 ROS 라디안 단위로 변환이 필요할 수 있음
-        // caemra_up_angle_ -> cv의 y,x좌표계 반영 ( 0도 부근에서 +, - 교차함)
+        //
+        // [컨벤션 정리]
+        //   ImgPreprocessor::camera_up_angle_ = atan2(vec.y, vec.x).
+        //   OpenCV는 y가 아래로 +이므로 raw_angle은 *CW positive*:
+        //     이미지 위쪽 방향(screen up, vec=(0,-1)) → -90°
+        //     이미지 오른쪽          (vec=(1,0))    →   0°
+        //     이미지 아래쪽          (vec=(0,+1))   → +90°
+        //     이미지 왼쪽            (vec=(-1,0))   → ±180°
+        //
+        // [목표 컨벤션] ROS yaw 표준 (CCW positive, x축=0°)
+        //   카메라 오른쪽=0°, 위=+90°, 왼쪽=±180°, 아래=-90°
+        //
+        // → y축 방향이 반대니까 부호를 반전해야 함 (linear algebra).
         double ros_angle_rad = -raw_angle * (M_PI / 180.0);
         ros_angle_rad        = std::atan2(std::sin(ros_angle_rad), std::cos(ros_angle_rad));
+
+        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 500,
+            "[angle] raw=%.1f° (cv, CW+)  → ros=%.1f° (CCW+)  (%.3f rad)",
+            raw_angle, ros_angle_rad * 180.0 / M_PI, ros_angle_rad);
 
         // 5. 최종 좌표 변환: L-Code 좌표 (550×550, 좌상단 원점) -> ROS 좌표 (우상향 X, 상향 Y)
 
@@ -146,20 +181,22 @@ private:
         last_y  = ros_y;
         last_th = ros_angle_rad;
 
-        initial_pos_found = true;
         RCLCPP_INFO(this->get_logger(), "L-Code 해독 성공  x: %d, y: %d, angle: %.1f°", raw_x, raw_y, raw_angle);
         RCLCPP_INFO(this->get_logger(), "map 좌표  x: %.3f m, y: %.3f m, angle: %.3f rad (%.1f°)", ros_x, ros_y, ros_angle_rad, -ros_angle_rad * 180.0 / M_PI);
 
-        // 5. 좌표와 방향을 퍼블리시 (TF 발행은 타이머에서 고정 주기로 계속 발행되도록 함)
-        publish_all(last_x, last_y, last_th, this->get_clock()->now());
+        // 5. 새 인식 결과를 바탕으로 map→odom 을 (재)계산하고 캐시에 박는다.
+        //    이후엔 타이머가 같은 transform 을 stamp 만 갱신하며 재발행한다.
+        update_map_to_odom(last_x, last_y, last_th, this->get_clock()->now());
     }
 
-    void publish_all(double map_x, double map_y, double map_th, const rclcpp::Time &stamp)
+    // 한 번의 L-Code 인식 결과로 map→odom 보정값을 새로 계산해 캐시에 저장하고 즉시 1회 발행한다.
+    // 이전 구현(publish_all) 과 달리 타이머에서는 호출되지 않는다.
+    void update_map_to_odom(double map_x, double map_y, double map_th, const rclcpp::Time &stamp)
     {
-        // --- 카メ라 → base_link 오프셋 (URDF에서 확인 후 값 입력) ---
+        // --- 카메라 → base_link 오프셋 (URDF에서 확인 후 값 입력) ---
         // 카메라가 base_link 기준으로 (cam_offset_x, cam_offset_y) 만큼 떨어져 있음
         // 예: 카메라가 로봇 앞쪽 0.15m, 좌측 0.0m에 있다면
-        static const double cam_offset_x = 0.08; // URDF 확인 후 수정
+        static const double cam_offset_x = 0.055; // URDF 확인 후 수정
         static const double cam_offset_y = 0.0;  // URDF 확인 후 수정
 
         // L-Code가 알려준 좌표는 카메라 위치(map 프레임)
@@ -204,22 +241,21 @@ private:
         double corr_x = base_x - (cos_dt * odom_x - sin_dt * odom_y);
         double corr_y = base_y - (sin_dt * odom_x + cos_dt * odom_y);
 
-        geometry_msgs::msg::TransformStamped t;
-        t.header.stamp            = stamp;
-        t.header.frame_id         = "map";
-        t.child_frame_id          = "odom";
-        t.transform.translation.x = corr_x;
-        t.transform.translation.y = corr_y;
-        t.transform.translation.z = 0.0;
-
         tf2::Quaternion q;
         q.setRPY(0.0, 0.0, delta_th);
-        t.transform.rotation.x = q.x();
-        t.transform.rotation.y = q.y();
-        t.transform.rotation.z = q.z();
-        t.transform.rotation.w = q.w();
 
-        tf_broadcaster_->sendTransform(t);
+        // 캐시에 기록 (frame_id/child_frame_id 는 생성자에서 이미 설정됨)
+        cached_map_to_odom_.header.stamp            = stamp;
+        cached_map_to_odom_.transform.translation.x = corr_x;
+        cached_map_to_odom_.transform.translation.y = corr_y;
+        cached_map_to_odom_.transform.translation.z = 0.0;
+        cached_map_to_odom_.transform.rotation.x    = q.x();
+        cached_map_to_odom_.transform.rotation.y    = q.y();
+        cached_map_to_odom_.transform.rotation.z    = q.z();
+        cached_map_to_odom_.transform.rotation.w    = q.w();
+
+        // 즉시 1회 발행 (타이머 주기를 기다리지 않고 빠르게 반영).
+        tf_broadcaster_->sendTransform(cached_map_to_odom_);
     }
 };
 

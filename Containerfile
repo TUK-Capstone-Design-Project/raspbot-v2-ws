@@ -211,4 +211,27 @@ RUN apt-get update && \
     && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
+RUN cd /tmp && \
+    git clone https://github.com/raspberrypi/rpicam-apps.git && \
+    cd rpicam-apps && \
+    meson setup build \
+        -Denable_libav=disabled \
+        -Denable_drm=enabled \
+        -Denable_egl=disabled \
+        -Denable_qt=disabled \
+        -Denable_opencv=disabled \
+        -Denable_tflite=disabled \
+        -Denable_hailo=disabled \
+        && \
+    meson compile -C build && \
+    meson install -C build && \
+    ldconfig && \
+    cd .. && rm -rf rpicam-apps
+
+COPY scripts/entrypoint.sh /entrypoint.sh 
+
+RUN chmod +x /entrypoint.sh
+
+ENTRYPOINT ["/entrypoint.sh"]
+
 CMD ["/bin/bash"]

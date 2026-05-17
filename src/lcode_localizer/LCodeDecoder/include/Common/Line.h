@@ -1,12 +1,13 @@
 #pragma once
 #include <cmath> // std::atan2, std::abs
 #include <opencv2/core.hpp>
+#include <opencv2/core/types.hpp>
 
 namespace LCODE {
 template <typename T>
 struct Line {
-  cv::Point_<T> pt1, pt2;
-
+  cv::Point_<T>             pt1, pt2;
+  std::vector<cv::KeyPoint> dots;
   Line() noexcept : pt1(), pt2() {}
   Line(const cv::Point_<T> &point1, const cv::Point_<T> &point2) noexcept : pt1(point1), pt2(point2) {}
   Line(T x1, T y1, T x2, T y2) noexcept : pt1(x1, y1), pt2(x2, y2) {}

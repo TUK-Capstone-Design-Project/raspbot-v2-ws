@@ -59,6 +59,7 @@ public:
   std::vector<cv::Point2f>              transformed_points;           /// warpPerspective 변환된 ROI 영역의 Dot 포인트들
   cv::Point2f                           transformed_CP;               /// warpPerspective ROI 영역의 cross_point의 위치
   std::vector<std::vector<cv::Point2f>> middle_baseLines_dots_in_ROI; /// ROI 영역 내부의 기준선들 위에 있는 점들을 담음
+  auto                                  getErrorMessage() -> String;
 
 private:
   LineProcessor lineProcessor_;
@@ -78,7 +79,6 @@ private:
 
   int LBS_error_code = -1;
   /// @brief LBS 에러 메세지 확인
-  auto getErrorMessage() -> String;
 
   int ROI_width_dots;
   int ROI_height_dots;
@@ -120,9 +120,13 @@ private:
   int                            maxArea_;
   int                            minDistBetweenBlobs_;
 
+  std::vector<Line<int>>              baseline_candidates_;
+  std::vector<Line<int>>              sideLines_;
   std::vector<cv::KeyPoint>           all_detected_dots_; /// SBD를 통해 검출된 모든 점들의 좌표를 담음
   std::vector<std::vector<Line<int>>> clustered_lines;    /// 클러스터 완료된 라인들; clustered_lines
-  std::vector<std::vector<Line<int>>> closestLines;       /// closest_dot_to_image_center랑 가장 가까운 n개의 기준선
+
+  /// closest_dot_to_image_center랑 가장 가까운 n개의 기준선, closestLines[0]는 항상 중앙에 있는 선을의미함.
+  std::vector<std::vector<Line<int>>> closestLines;
 
   bool is_crosshair_on_baseline = false; /// crosshair가 baseline의 위에 위치하는지 확인.
 
@@ -133,8 +137,8 @@ private:
   cv::KeyPoint closest_dot_to_cross_point; /// img_cross_point 제일 가까운 Dot을 선정
   cv::KeyPoint closest_baseline_dot;       /// closest_dot_to_cross_point 가장 가까운 baselines 위에 있는 Dot
 
-  std::vector<std::vector<cv::KeyPoint>>
-      nth_closest_keypoints_on_baseline; /// closetstLine의 순서대로 baseline 위에 있는 점들을 담은 객체
+  /// closetstLine의 순서대로 baseline 위에 있는 점들을 담은 객체
+  std::vector<std::vector<cv::KeyPoint>> nth_closest_keypoints_on_baseline;
   std::vector<std::tuple<cv::Point2f, Line<int>, int>>
       side_line_info; /// 양쪽 side를 담당할 baseline들의 Line과 closestLiens객체 내부의 idx 위치를 담은 객체
   std::vector<cv::KeyPoint>
@@ -157,7 +161,7 @@ private:
    * 2.SBD로 검출된 점 지움 \n
    * 3.Canny openCV API로 edge 검출
    */
-  void binarizeImage();
+  cv::Mat binarizeImage(const cv::Mat &src);
 
   bool verifyDotCount();
   /**
@@ -173,6 +177,8 @@ private:
    * @return 점 검출 성공 여부
    */
   auto DetectDotsBySimpleBlobDetector() -> bool;
+
+  cv::Mat extractDots(const cv::Mat &src, double minArea = 5.0, double maxAspectRatio = 1.5);
 
   /**
    * @brief DetectDotsBySimpleBlobDetector로 검출된 점을 src에서 지움
@@ -203,8 +209,8 @@ private:
    */
   //   bool detectBaseLine_Hough(cv::Mat &img, std::vector<cv::Vec2f> &detected_polar_lines);
 
-  /** @brief Houghlines로 검출된 polar 좌표계의 라인들 x,y좌표평면계로 전환후 polar_to_cartesian_lines에 전환된 라인들을
-   *넣음.
+  /** @brief Houghlines로 검출된 polar 좌표계의 라인들 x,y좌표평면계로 전환후 polar_to_cartesian_lines에 전환된
+   * 라인들을 넣음.
    *  @param detected_polar_lines  houghlines를 통해 검출된 극좌표계 상의 선들
    *	@param polar_to_cartesian_lines  극좌표계 -> 데카르트 좌표계로 전환된 선들
    *  @return 선 전환 성공 여부
@@ -239,6 +245,7 @@ private:
    */
   auto findClosestDotToCP() -> bool;
 
+  void addDotsOnLine();
   /**
    * @brief closest_dot_to_image_center을 기준, 라인 정렬
    * @details

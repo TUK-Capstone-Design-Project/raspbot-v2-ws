@@ -1,6 +1,6 @@
 #include "Digitizer/Digitizer.hpp"
 
-// #define DEBUG_LOG
+#define DEBUG_LOG
 
 namespace LCODE {
 
@@ -140,33 +140,6 @@ void Digitizer::FindBaselineInSubset(unordered_map<pair<int, int>, Point2f, pair
     }
   }
 }
-
-// /// @brief 서브셋에서 올바른 grid를 그렸을때 생기는 grid의 모든 교점 좌표를 만들어 내는 함수
-// /// @param subset COL x ROW 크기로 추출된 서브셋 점들(input)
-// /// @param devidedWidth 점과 점사이의 거리 (input)
-// /// @param baselineIndex 서브셋에서 기준선이 가지는 X index 값 (input)
-// /// @param baselineX 기준선의 x좌표 값 (input)
-// /// @param crossPoints grid의 교점들 (output)
-// void FindCrossPoint(unordered_map<pair<int, int>, Point2f, pair_hash>* subset, float devidedWidth, vector<int>
-// baselineIndex,
-//                      vector<float> baselineX, unordered_map<pair<int, int>, Point2f, pair_hash>* crossPoints)
-// {
-//     vector<float> grid_X; //세로방향
-//     for (int i = -baselineIndex[0]; i < subCol - baselineIndex[0]; i++)
-//     {
-//         grid_X.push_back(baselineX[0] + devidedWidth * i);
-//     }
-
-//     for (int i = 0; i < subRow; i++)
-//     {
-//         for (int j = 0; j < subCol; j++)
-//         {
-//             //dotPoint dotpoint = { grid_X[j], (*subset)[make_pair(baselineIndex, i)].y, j, i, DOTTYPE::NOISE};
-//             (*crossPoints)[make_pair(j, i)] = Point2f(grid_X[j], (*subset)[make_pair(baselineIndex[0], i)].y);
-//         }
-//     }
-// }
-
 bool Digitizer::digitize(unordered_map<pair<int, int>, Point2f, pair_hash> *crossPoints,
                          unordered_map<pair<int, int>, Point2f, pair_hash> *subset, vector<int> baselineIndex) {
   float               degreeErr = 0.0f;
@@ -191,56 +164,27 @@ bool Digitizer::digitize(unordered_map<pair<int, int>, Point2f, pair_hash> *cros
       float   x_distance = targetDot.x - centerDot.x;
       float   degree     = atan2(y_distance, x_distance) * 180 / CV_PI;
 
-      float deltaDegree = 360 / (8.0 * 2);
-      // int dotType = 0;
-      // degree += 180;
-      // bool isFine = false;
-      //  for (int i = 0; i <= 45; i += 45)
-      //  {
-      //      for (int j = 0; j <= 360; j += 90)
-      //      {
-      //          int centerDegree = i + j;
-
-      //         if(centerDegree - deltaDegree <= degree && degree <= centerDegree + deltaDegree)
-      //         {
-
-      //             isFine = true;
-      //             break;
-      //         }
-
-      //         dotType += 1;
-      //     }
-      //     if(isFine) break;
-      //     dotType += 4;
-      // }
-
-      if (degree < -180 + deltaDegree || degree >= 180 - deltaDegree) {
-        degreeErr = max(abs(abs(degree) - 180), degreeErr);
-        temp.push_back(LEFT);
-      } else if (degree >= 90 - deltaDegree && degree < 90 + deltaDegree) {
-        degreeErr = max(abs(degree - 90), degreeErr);
-        temp.push_back(BOTTOM);
-      } else if (degree >= 0 - deltaDegree && degree < 0 + deltaDegree) {
+      // 4방향 판별 로직: 각 방향당 90도 영역 할당 (중심 기준 ±45도)
+      if (degree >= -45 && degree < 45) {
+        // RIGHT (0도 중심)
         degreeErr = max(abs(degree), degreeErr);
         temp.push_back(RIGHT);
-      } else if (degree >= -90 - deltaDegree && degree < -90 + deltaDegree) {
+      } else if (degree >= 45 && degree < 135) {
+        // BOTTOM (90도 중심)
+        degreeErr = max(abs(degree - 90), degreeErr);
+        temp.push_back(BOTTOM);
+      } else if (degree >= 135 || degree < -135) {
+        // LEFT (180도 또는 -180도 중심)
+        degreeErr = max(abs(abs(degree) - 180), degreeErr);
+        temp.push_back(LEFT);
+      } else if (degree >= -135 && degree < -45) {
+        // TOP (-90도 중심)
         degreeErr = max(abs(degree + 90), degreeErr);
         temp.push_back(TOP);
-      } else if (degree >= -135 - deltaDegree && degree < -135 + deltaDegree) {
-        degreeErr = max(abs(degree + 135), degreeErr);
-        temp.push_back(LEFT_TOP);
-      } else if (degree >= -45 - deltaDegree && degree < -45 + deltaDegree) {
-        degreeErr = max(abs(degree + 45), degreeErr);
-        temp.push_back(RIGHT_TOP);
-      } else if (degree >= 45 - deltaDegree && degree < 45 + deltaDegree) {
-        degreeErr = max(abs(degree - 45), degreeErr);
-        temp.push_back(RIGHT_BOTTOM);
-      } else if (degree >= 135 - deltaDegree && degree < 135 + deltaDegree) {
-        degreeErr = max(abs(degree - 135), degreeErr);
-        temp.push_back(LEFT_BOTTOM);
       }
     }
     digitizedOutput.push_back(temp);
+
     if (MaxAngle < degreeErr)
       return false;
   }
@@ -248,6 +192,66 @@ bool Digitizer::digitize(unordered_map<pair<int, int>, Point2f, pair_hash> *cros
   // cout << "(디지털화 부분) 각도(육십분법) 최대 오차 :" << degreeErr << endl;
   return true;
 }
+// bool Digitizer::digitize(unordered_map<pair<int, int>, Point2f, pair_hash> *crossPoints,
+//                          unordered_map<pair<int, int>, Point2f, pair_hash> *subset, vector<int> baselineIndex) {
+//   float               degreeErr = 0.0f;
+//   vector<vector<int>> digitizedOutput;
+//   for (int i = 0; i < subRow; i++) {
+//     vector<int> temp;
+//     for (int j = 0; j < subCol; j++) {
+//       bool isBaseline = false;
+//       for (int var : baselineIndex) {
+//         if (j == var) {
+//           temp.push_back(CENTER);
+//           isBaseline = true;
+//           break;
+//         }
+//       }
+//       if (isBaseline)
+//         continue;
+
+//       Point2f centerDot  = (*crossPoints)[make_pair(j, i)];
+//       Point2f targetDot  = (*subset)[make_pair(j, i)];
+//       float   y_distance = targetDot.y - centerDot.y;
+//       float   x_distance = targetDot.x - centerDot.x;
+//       float   degree     = atan2(y_distance, x_distance) * 180 / CV_PI;
+
+//       float deltaDegree = 360 / (8.0 * 2);
+
+//       if (degree < -180 + deltaDegree || degree >= 180 - deltaDegree) {
+//         degreeErr = max(abs(abs(degree) - 180), degreeErr);
+//         temp.push_back(LEFT);
+//       } else if (degree >= 90 - deltaDegree && degree < 90 + deltaDegree) {
+//         degreeErr = max(abs(degree - 90), degreeErr);
+//         temp.push_back(BOTTOM);
+//       } else if (degree >= 0 - deltaDegree && degree < 0 + deltaDegree) {
+//         degreeErr = max(abs(degree), degreeErr);
+//         temp.push_back(RIGHT);
+//       } else if (degree >= -90 - deltaDegree && degree < -90 + deltaDegree) {
+//         degreeErr = max(abs(degree + 90), degreeErr);
+//         temp.push_back(TOP);
+//       } else if (degree >= -135 - deltaDegree && degree < -135 + deltaDegree) {
+//         degreeErr = max(abs(degree + 135), degreeErr);
+//         temp.push_back(LEFT_TOP);
+//       } else if (degree >= -45 - deltaDegree && degree < -45 + deltaDegree) {
+//         degreeErr = max(abs(degree + 45), degreeErr);
+//         temp.push_back(RIGHT_TOP);
+//       } else if (degree >= 45 - deltaDegree && degree < 45 + deltaDegree) {
+//         degreeErr = max(abs(degree - 45), degreeErr);
+//         temp.push_back(RIGHT_BOTTOM);
+//       } else if (degree >= 135 - deltaDegree && degree < 135 + deltaDegree) {
+//         degreeErr = max(abs(degree - 135), degreeErr);
+//         temp.push_back(LEFT_BOTTOM);
+//       }
+//     }
+//     digitizedOutput.push_back(temp);
+//     if (MaxAngle < degreeErr)
+//       return false;
+//   }
+//   this->digitizied_array = digitizedOutput;
+//   // cout << "(디지털화 부분) 각도(육십분법) 최대 오차 :" << degreeErr << endl;
+//   return true;
+// }
 
 bool Digitizer::runDigitize(vector<Point2f> &entireDotsInfo, Point2f CP, vector<vector<Point2f>> &baselineDots,
                             int ROIwidth, int ROIheight) {

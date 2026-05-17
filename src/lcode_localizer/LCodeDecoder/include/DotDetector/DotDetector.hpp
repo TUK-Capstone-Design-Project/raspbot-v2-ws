@@ -6,6 +6,7 @@ class DotDetector {
 public:
   auto detectBySimpleBlobDetector(const cv::Mat &img, std::vector<cv::KeyPoint> &dots) -> bool;
 
+  auto detectBylable(const cv::Mat &img) -> std::vector<cv::KeyPoint>;
   void setupParameters(cv::SimpleBlobDetector::Params params);
 
 private:

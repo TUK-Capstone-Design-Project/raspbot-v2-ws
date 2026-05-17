@@ -34,7 +34,7 @@ auto LineProcessor::detectBaseLines(cv::Mat &img) -> bool {
 
     // 클러스터된 선의 갯수가 타겟 갯수 내애 들어오지 않으면 최대 n번 반복
     if (!validateClusterSize()) {
-      std::cout << "Cluster size not valid : " << clustered_lines.size() << "\n";
+      // std::cout << "Cluster size not valid : " << clustered_lines.size() << "\n";
       continue;
     }
     std::vector<Line<int>> candidateLines;
@@ -53,6 +53,9 @@ auto LineProcessor::detectBaseLines(cv::Mat &img) -> bool {
 
     // 조건을 만족하는 clustered_lines가 존재할 경우 루프 탈출
     break;
+  }
+  if (clustered_lines.size() < 3) {
+    return false;
   }
 
   return true;
@@ -281,7 +284,7 @@ auto LineProcessor::getClusteredLines() -> std::vector<std::vector<Line<int>>> {
 
 auto LineProcessor::clusterLines(bool &cluster_valid_check, std::vector<Line<int>> &polar_to_cartesian_lines) -> bool {
   Line<int>       representative; // cluster 수행중에 대표라인을 담을 Line 구조체 선언
-  constexpr float RANGE_TOLERANCE = 1.3f;
+  constexpr float RANGE_TOLERANCE = 1.1f;
   constexpr float DIST_TOLERANCE =
       40; // 선분의 시작점과 끝점이 모두 이 수치 내에 있을 때 같은 군으로 판단하는 임의의 수치
   // 위치 클러스터링
@@ -290,7 +293,7 @@ auto LineProcessor::clusterLines(bool &cluster_valid_check, std::vector<Line<int
 
   // 클러스터된 선의 갯수가 타겟 갯수 내애 들어오지 않으면 최대 n번 반복
   if (!validateClusterSize()) {
-    std::cout << "Cluster size not valid : " << clustered_lines.size() << "\n";
+    // std::cout << "Cluster size not valid : " << clustered_lines.size() << "\n";
     return false;
   }
 

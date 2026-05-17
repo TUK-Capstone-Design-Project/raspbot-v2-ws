@@ -1,4 +1,5 @@
 #include "DotDetector/DotDetector.hpp"
+#include <opencv2/core/types.hpp>
 
 namespace LCODE {
 void DotDetector::setupParameters(cv::SimpleBlobDetector::Params params) {
@@ -72,88 +73,57 @@ auto DotDetector::detectBySimpleBlobDetector(const cv::Mat &img, std::vector<cv:
 //   return true;
 // }
 
-// auto ImgPreprocessor::DetectDotsBySimpleBlobDetector() -> bool {
-//   if (this->src.empty()) {
-//     this->checkFlow      = false;
-//     this->LBS_error_code = SBD_error;
-//     return false;
-//   }
+auto DotDetector::detectBylable(const cv::Mat &img) -> std::vector<cv::KeyPoint> {
+  std::vector<cv::KeyPoint> dots;
+  // 고속 레이블링 시도
+  cv::Mat labels, stats, centroids;
+  int     nLabels = cv::connectedComponentsWithStats(img, labels, stats, centroids, 8, CV_32S);
 
-//   try {
-//     this->detected_all_dots.clear();
+  for (int i = 1; i < nLabels; i++) {
+    int    area = stats.at<int>(i, cv::CC_STAT_AREA);
+    int    w    = stats.at<int>(i, cv::CC_STAT_WIDTH);
+    int    h    = stats.at<int>(i, cv::CC_STAT_HEIGHT);
+    double cx   = centroids.at<double>(i, 0);
+    double cy   = centroids.at<double>(i, 1);
 
-//     // cv::Mat blurred;
-//     // cv::medianBlur(this->gray, blurred, 3);
+    // 필터링 로직 (Area, AspectRatio, Solidity 등)
+    // int min_area = 6;
+    // int max_area = 50;
+    // if (area < min_area || area > max_area)
+    //   continue;
 
-//     // 2. 이진화
-//     cv::Mat binary;
-//     cv::threshold(gray, binary, 0, 255, cv::THRESH_BINARY_INV | cv::THRESH_OTSU);
+    double aspectRatio = static_cast<double>(w) / h;
+    if (aspectRatio < 0.2 || aspectRatio > 2.5)
+      continue;
 
-//     // 3. 고속 레이블링
-//     cv::Mat labels, stats, centroids;
-//     int     nLabels = cv::connectedComponentsWithStats(binary, labels, stats, centroids, 8, CV_32S);
+    // if (this->filterByCircularity) {
+    //   double rectArea = static_cast<double>(w * h);
+    //   if (((double)area / rectArea) < this->min_circularity)
+    //     continue;
+    // }
 
-//     for (int i = 1; i < nLabels; i++) {
-//       int    area = stats.at<int>(i, cv::CC_STAT_AREA);
-//       int    w    = stats.at<int>(i, cv::CC_STAT_WIDTH);
-//       int    h    = stats.at<int>(i, cv::CC_STAT_HEIGHT);
-//       double cx   = centroids.at<double>(i, 0);
-//       double cy   = centroids.at<double>(i, 1);
+    // if (this->filterByConvexity) {
+    //   double inertia = (w < h) ? (double)w / h : (double)h / w;
+    //   if (inertia < this->min_inertia)
+    //     continue;
+    // }
 
-//       // 필터링 로직 (Area, AspectRatio, Solidity 등)
-//       // if (this->filterByArea && (area < this->minArea || area > this->maxArea))
-//       //   continue;
+    float size = std::sqrt(area * 4.0f / CV_PI);
+    dots.emplace_back(cv::Point2f(static_cast<float>(cx), static_cast<float>(cy)), size);
+  }
 
-//       double aspectRatio = static_cast<double>(w) / h;
-//       if (aspectRatio < 0.4 || aspectRatio > 2.5)
-//         continue;
+  // --- 시각화 로직 시작 ---
+  cv::Mat visImg;
+  visImg = img.clone();
 
-//       // if (this->filterByCircularity) {
-//       //   double rectArea = static_cast<double>(w * h);
-//       //   if (((double)area / rectArea) < this->min_circularity)
-//       //     continue;
-//       // }
+  for (size_t i = 0; i < dots.size(); i++) {
+    const auto &kp = dots[i];
+    // 1. 검출된 점에 원 그리기 (녹색)
+    cv::circle(visImg, kp.pt, static_cast<int>(kp.size / 2), cv::Scalar(0, 255, 0), 2);
+    // 2. 점 번호 매기기 (빨간색)
+  }
 
-//       // if (this->filterByConvexity) {
-//       //   double inertia = (w < h) ? (double)w / h : (double)h / w;
-//       //   if (inertia < this->min_inertia)
-//       //     continue;
-//       // }
-
-//       float size = std::sqrt(area * 4.0f / CV_PI);
-//       this->detected_all_dots.emplace_back(cv::Point2f(static_cast<float>(cx), static_cast<float>(cy)), size);
-//     }
-
-//     // --- 시각화 로직 시작 ---
-//     cv::Mat visImg;
-//     if (this->src.channels() == 1)
-//       cv::cvtColor(this->src, visImg, cv::COLOR_GRAY2BGR);
-//     else
-//       visImg = this->src.clone();
-
-//     for (size_t i = 0; i < this->detected_all_dots.size(); i++) {
-//       const auto &kp = this->detected_all_dots[i];
-//       // 1. 검출된 점에 원 그리기 (녹색)
-//       cv::circle(visImg, kp.pt, static_cast<int>(kp.size / 2), cv::Scalar(0, 255, 0), 2);
-//       // 2. 점 번호 매기기 (빨간색)
-//     }
-
-//     std::cerr << "[FastBlob] Detected points: " << this->detected_all_dots.size() << "\n";
-//     cv::imshow("Binary Mask", binary);      // 이진화 결과 확인 (임계값 튜닝용)
-//     cv::imshow("Detection Result", visImg); // 최종 검출 결과 확인
-//     cv::waitKey(1);                         // 0이면 멈춤, 1이면 영상처럼 흐름
-//     // --- 시각화 로직 끝 ---
-
-//   } catch (const std::exception &e) {
-//     this->checkFlow      = false;
-//     this->LBS_error_code = SBD_error;
-// #ifdef DEBUG_LOG
-//     std::cerr << "[SBD_Replacement] Exception: " << e.what() << "\n";
-// #endif
-//     return false;
-//   }
-
-//   return true;
-// }
+  return dots;
+}
 
 } // namespace LCODE

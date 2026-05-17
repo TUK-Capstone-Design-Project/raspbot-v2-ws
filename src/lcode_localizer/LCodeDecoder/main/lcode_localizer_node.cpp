@@ -21,7 +21,7 @@
 #include "Digitizer/Digitizer.hpp"
 #include "ImgPreprocessor/ImgPreprocessor.hpp"
 
-// #define DECODER_DEBUG_MODE // 디버그 모드 비활성화
+#define DECODER_DEBUG_MODE // 디버그 모드 비활성화
 
 class LCodeLocalizerNode : public rclcpp::Node
 {
@@ -147,8 +147,9 @@ private:
             return;
         }
         #ifdef DECODER_DEBUG_MODE
-        cv::imwrite("./resize_images/success/" + std::to_string(success_count++) + ".jpg", src); // 디버깅용 성공 이미지 저장
+        // cv::imwrite("./resize_images/success/" + std::to_string(success_count++) + ".jpg", src); // 디버깅용 성공 이미지 저장
         #endif
+        
         // 4. 방향(Heading) 계산 (L-Code에서 준 angle 반영);
         //
         // [컨벤션 정리]
@@ -166,9 +167,9 @@ private:
         double ros_angle_rad = -raw_angle * (M_PI / 180.0);
         ros_angle_rad        = std::atan2(std::sin(ros_angle_rad), std::cos(ros_angle_rad));
 
-        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 500,
-            "[angle] raw=%.1f° (cv, CW+)  → ros=%.1f° (CCW+)  (%.3f rad)",
-            raw_angle, ros_angle_rad * 180.0 / M_PI, ros_angle_rad);
+        // RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 500,
+        //     "[angle] raw=%.1f° (cv, CW+)  → ros=%.1f° (CCW+)  (%.3f rad)",
+        //     raw_angle, ros_angle_rad * 180.0 / M_PI, ros_angle_rad);
 
         // 5. 최종 좌표 변환: L-Code 좌표 (550×550, 좌상단 원점) -> ROS 좌표 (우상향 X, 상향 Y)
 
@@ -182,7 +183,9 @@ private:
         last_th = ros_angle_rad;
 
         RCLCPP_INFO(this->get_logger(), "L-Code 해독 성공  x: %d, y: %d, angle: %.1f°", raw_x, raw_y, raw_angle);
-        RCLCPP_INFO(this->get_logger(), "map 좌표  x: %.3f m, y: %.3f m, angle: %.3f rad (%.1f°)", ros_x, ros_y, ros_angle_rad, -ros_angle_rad * 180.0 / M_PI);
+
+        // 필요시 map좌표 on
+        // RCLCPP_INFO(this->get_logger(), "map 좌표  x: %.3f m, y: %.3f m, angle: %.3f rad (%.1f°)", ros_x, ros_y, ros_angle_rad, -ros_angle_rad * 180.0 / M_PI);
 
         // 5. 새 인식 결과를 바탕으로 map→odom 을 (재)계산하고 캐시에 박는다.
         //    이후엔 타이머가 같은 transform 을 stamp 만 갱신하며 재발행한다.

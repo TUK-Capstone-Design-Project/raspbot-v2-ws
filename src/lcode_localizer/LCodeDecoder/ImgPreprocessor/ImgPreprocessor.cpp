@@ -1,13 +1,15 @@
 #include "ImgPreprocessor/ImgPreprocessor.hpp"
 #include "Common/Line.h"
 #include "ConfigSettings/ConfigSettings.hpp"
+#include <opencv2/core.hpp>
 #include <opencv2/core/types.hpp>
 #include <opencv2/highgui.hpp>
+#include <opencv2/opencv.hpp>
 #include <opencv2/ximgproc.hpp>
 using namespace std;
 
 // #define SHOW_VIDEO
-
+// #define debug_log
 namespace LCODE {
 
 ImgPreprocessor::ImgPreprocessor(ConfigSettings &config) : lineProcessor_(config) {
@@ -67,7 +69,8 @@ void ImgPreprocessor::eraseDetectedDots(cv::Mat &img, vector<cv::KeyPoint> &dots
   this->warp_source_orient = img.clone();
 }
 
-void ImgPreprocessor::binarizeImage() {
+auto ImgPreprocessor::binarizeImage(const cv::Mat &img) -> cv::Mat {
+  cv::Mat       output;
   constexpr int mode = 0;
   if (mode == 0) {
     double k                  = 0.07; // 보통 -0.2 ~ -0.5 사이. 작을수록 더 많은 점을 잡습니다.
@@ -75,21 +78,17 @@ void ImgPreprocessor::binarizeImage() {
     int    binarizationMethod = cv::ximgproc::BINARIZATION_SAUVOLA;
     // Niblack 적용
     // 결과는 검은 배경에 흰 점(BINARY) 또는 반대(BINARY_INV)로 설정 가능합니다.
-    cv::ximgproc::niBlackThreshold(this->gray, this->binarized, 255, cv::THRESH_BINARY_INV, blockSize, k,
-                                   binarizationMethod);
+    cv::ximgproc::niBlackThreshold(img, output, 255, cv::THRESH_BINARY_INV, blockSize, k, binarizationMethod);
   } else {
     constexpr int maxValue       = 255;
     constexpr int adaptiveMethod = cv::ADAPTIVE_THRESH_GAUSSIAN_C;
     constexpr int thresholdType  = cv::THRESH_BINARY_INV;
     constexpr int blockSize      = 15; // 11~21 normally  , 홀수
     int           C = 8; //-10~ 10 normally 가중평균에서 빼는 상수 .. -> threahold 조정역할 클수록 이미지 어두움
-    cv::adaptiveThreshold(this->gray, this->binarized, maxValue, adaptiveMethod, thresholdType, blockSize, C);
+    cv::adaptiveThreshold(img, output, maxValue, adaptiveMethod, thresholdType, blockSize, C);
   }
 
-#ifdef SHOW_VIDEO
-  imshow("Thresholded", binarized);
-  waitKey(0);
-#endif //! SHOW_VIDEO
+  return output;
 }
 
 auto ImgPreprocessor::findClosestDotToCP() -> bool {
@@ -130,6 +129,7 @@ auto ImgPreprocessor::findClosestDotToCP() -> bool {
 void ImgPreprocessor::orderBaseLinesByClosestDot() {
   // 점과 선분 사이 거리 , 해당 선분을 묶어 저장
   std::vector<std::pair<std::vector<Line<int>>, double>> line_to_dot_distances;
+
   for (const auto &cluster : clustered_lines) {
     for (const auto &line : cluster) {
       double dist = distanceFromPointToLine(closest_dot_to_cross_point.pt, line.pt1, line.pt2);
@@ -154,8 +154,8 @@ void ImgPreprocessor::orderBaseLinesByClosestDot() {
       return center - closest_dot_to_cross_point.pt;
     };
 
-    // 두번째, 세번째 선이 같은 방향 벡터면 , [0]으로 할당된 선분을 [1]과 교체함
-    // [0]으로 할당되는 선은 중앙에 있는 선분이 되어야하기 때문
+    // 거리로 나열한 두번째, 세번째 선이 같은 방향 벡터면 , [0]으로 할당된 선분을 [1]과 교체함
+    // closestLines[0]으로 할당되는 선은 항상 중앙에 있는 선분이 되어야하기 때문
     auto vec_1 = get_side_vec(this->closestLines[1]);
     auto vec_2 = get_side_vec(this->closestLines[2]);
 
@@ -165,25 +165,6 @@ void ImgPreprocessor::orderBaseLinesByClosestDot() {
       std::swap(this->closestLines[0], this->closestLines[1]);
     }
   }
-#ifdef SHOW_VIDEO
-  cv::Mat    temp_src = this->src.clone();
-  cv::Scalar color(255, 0, 0);  // 제일가까운
-  cv::Scalar color2(0, 255, 0); // 두번째로 가까운
-  cv::Scalar color3(0, 0, 255); // 세번째로 가까운
-  for (int i = 0; i < closestLines.size(); i++) {
-    for (const auto &line : closestLines[i]) {
-      if (i == 0) {
-        cv::line(temp_src, line.pt1, line.pt2, color, 2);
-      } else if (i == 1) {
-        cv::line(temp_src, line.pt1, line.pt2, color2, 2);
-      } else if (i == 2) {
-        cv::line(temp_src, line.pt1, line.pt2, color3, 2);
-      }
-    }
-  }
-  imshow("orderBaseLinesByClosestDot", temp_src);
-  waitKey(0);
-#endif
 }
 
 auto ImgPreprocessor::distanceFromPointToLine(cv::Point pt, cv::Point lineStart, cv::Point lineEnd) -> double {
@@ -194,22 +175,40 @@ auto ImgPreprocessor::distanceFromPointToLine(cv::Point pt, cv::Point lineStart,
 }
 
 auto ImgPreprocessor::findValidLinesByDotsLocation() -> bool {
-  vector<vector<Line<int>>> validated_lines;
-  double                    tolerenceMax_between_line_to_dot = closest_dot_to_cross_point.size * 2.5;
-  const int                 required_dots                    = (expansion_point_num * 2) + 1; // 반복 연산 변수화
+  if (all_detected_dots_.empty() || closestLines.empty()) {
+    return false;
+  }
 
-  // 선 위 점이 없는 선들을 제거
-  for (const auto &line : closestLines) {
-    vector<Line<int>> valid_line_group; // 그룹을 담을 벡터를 첫 번째 루프 안에 선언
+  std::vector<std::vector<Line<int>>> validated_lines;
 
-    for (const auto &lin : line) {
+  // 1. 모든 루프에서 고정된 상수 및 제곱값 미리 계산
+  const double tolerance     = closest_dot_to_cross_point.size * 1.2;
+  const double tolerance_sq  = tolerance * tolerance;
+  const int    required_dots = (expansion_point_num * 2) + 1;
+
+  for (const auto &line_group : closestLines) {
+    std::vector<Line<int>> valid_line_group;
+
+    for (const auto &lin : line_group) {
+      // 2. 선분(lin) 고유의 수식 값들을 '점 루프' 진입 전에 딱 한 번만 계산 (★핵심 최적화)
+      const double dx = static_cast<double>(lin.pt2.x - lin.pt1.x);
+      const double dy = static_cast<double>(lin.pt2.y - lin.pt1.y);
+
+      const double denominator_sq    = (dy * dy) + (dx * dx);
+      const double max_dist_sq_denom = tolerance_sq * denominator_sq;
+      const double line_const = static_cast<double>(lin.pt2.x) * lin.pt1.y - static_cast<double>(lin.pt2.y) * lin.pt1.x;
+
       int cnt = 0;
+
+      // 3. 내부 루프에서는 최소한의 연산만 수행
       for (const auto &dot : all_detected_dots_) {
-        if (this->isKeyPointNearLine(dot, lin.pt1, lin.pt2, tolerenceMax_between_line_to_dot)) {
+        const double numerator = (dy * dot.pt.x) - (dx * dot.pt.y) + line_const;
+
+        if ((numerator * numerator) <= max_dist_sq_denom) {
           cnt++;
-        }
-        if (cnt >= required_dots) {
-          break;
+          if (cnt >= required_dots) {
+            break; // 필요한 개수를 채우면 즉시 점 루프 완전히 탈출
+          }
         }
       }
 
@@ -217,116 +216,177 @@ auto ImgPreprocessor::findValidLinesByDotsLocation() -> bool {
       if (cnt >= required_dots) {
         valid_line_group.push_back(lin);
       }
-      // 조건에 안 맞는다고 break 하지 않음 (나머지 선들도 검사해야 하므로)
     }
 
     // 그룹 내에 유효한 선이 하나라도 있으면 최종 결과에 추가
     if (!valid_line_group.empty()) {
-      validated_lines.push_back(valid_line_group);
+      // std::move를 사용하여 벡터 복사 오버헤드 방지
+      validated_lines.push_back(std::move(valid_line_group));
     }
   }
 
-  closestLines = validated_lines;
+  closestLines = std::move(validated_lines);
   return true;
 }
 
 auto ImgPreprocessor::findValidLinesByDotsNum() -> bool {
-  bool callCnt = 0;
-  // 한 프레임에 두번만 반복
-  for (int i = 0; i < 2; i++) {
+  // 1. 최소 기준선 개수 확보 체크
+  if (closestLines.size() < this->required_baseline_cnt) {
+    LBS_error_code = findValidLines_error;
+    return false;
+  }
+
+  // 매 루프마다 계산하지 않도록 상수를 바깥으로 선언
+  const double dist_tolerance         = this->closest_dot_to_cross_point.size * 1.2;
+  const double dist_tolerance_sq      = dist_tolerance * dist_tolerance;
+  const float  comp_dot_num_tolerance = 2.5f; //
+
+  // 잘못된 선을 제거하고 최대 2번까지 재검사(Retry) 수행
+  for (int retry = 0; retry < 2; retry++) {
+    // 선이 지워진 후 다음 루프에서 개수 미달 시 바로 실패 처리
     if (closestLines.size() < this->required_baseline_cnt) {
-      LBS_error_code = findValidLines_error;
       return false;
     }
 
-    std::vector<Line<int>> validate_lines;
-    for (int j = 0; j < this->required_baseline_cnt; j++) {
-      validate_lines.push_back({this->closestLines.at(j).at(0).pt1, this->closestLines.at(j).at(0).pt2});
+    // 각 선 위에 매칭된 점들을 모아둘 벡터 공간
+    std::vector<std::vector<cv::KeyPoint>> dots_on_line(this->required_baseline_cnt);
+
+    // [최적화] 선분 고유의 방정식 상수들을 점 루프 진입 전에 미리 캐싱
+    struct LineCache {
+      double dx, dy, line_const, max_dist_sq_denom;
+    };
+    std::vector<LineCache> line_caches;
+    line_caches.reserve(this->required_baseline_cnt);
+
+    for (int k = 0; k < this->required_baseline_cnt; k++) {
+      const auto &ln             = this->closestLines[k][0];
+      double      dx             = static_cast<double>(ln.pt2.x - ln.pt1.x);
+      double      dy             = static_cast<double>(ln.pt2.y - ln.pt1.y);
+      double      denominator_sq = (dy * dy) + (dx * dx);
+      double      line_const     = static_cast<double>(ln.pt2.x) * ln.pt1.y - static_cast<double>(ln.pt2.y) * ln.pt1.x;
+
+      line_caches.push_back({dx, dy, line_const, dist_tolerance_sq * denominator_sq});
     }
-    nth_closest_keypoints_on_baseline.clear();
-    nth_closest_keypoints_on_baseline.resize(required_baseline_cnt);
 
-    double dist_tolerance = this->closest_dot_to_cross_point.size * 1;
-
+    // [최적화] 중복 연산 없는 고속 거리 검사 및 점 분배
     for (const auto &key : all_detected_dots_) {
-      for (int k = 0; k < required_baseline_cnt; k++) {
-        if (isKeyPointNearLine(key, validate_lines[k].pt1, validate_lines[k].pt2, dist_tolerance)) {
-          nth_closest_keypoints_on_baseline[k].push_back(key);
+      for (int k = 0; k < this->required_baseline_cnt; k++) {
+        const auto &cache     = line_caches[k];
+        double      numerator = (cache.dy * key.pt.x) - (cache.dx * key.pt.y) + cache.line_const;
+
+        if ((numerator * numerator) <= cache.max_dist_sq_denom) {
+          dots_on_line[k].push_back(key);
         }
       }
     }
-    // isKeyPointNearLine을 통해 도출된 각 기준선 마다의 Dot의 갯수를 검사. 2.5배 이상의 갯수를 가지고 있는 해당라인을
-    // 지우고 다시 검사. check validate Lines
-    const float comp_dot_num_tolerence = 1.5;
-    for (int l = 0; l < required_baseline_cnt; l++) {
-      bool  check              = true;
-      float comp_keypoitns_cnt = static_cast<float>(nth_closest_keypoints_on_baseline[i].size());
-      for (int j = l; j < required_baseline_cnt; j++) {
-        float comp2_cnt = static_cast<float>(nth_closest_keypoints_on_baseline[j].size()) * comp_dot_num_tolerence;
-        if (comp_keypoitns_cnt >= comp2_cnt) {
-          this->closestLines.erase(closestLines.begin() + i + 1);
-          check = false;
+
+    // 다른 선들에 비해 점이 너무 많이 찍힌 (1.5배 이상) 이상치 선 찾아내기
+    bool line_erased = false;
+    for (int l = 0; l < this->required_baseline_cnt; l++) {
+      float comp_cnt = static_cast<float>(dots_on_line[l].size());
+
+      for (int j = 0; j < this->required_baseline_cnt; j++) {
+        if (l == j)
+          continue; // 자기 자신과의 비교는 제외
+
+        float target_limit = static_cast<float>(dots_on_line[j].size()) * comp_dot_num_tolerance;
+
+        // l번째 선의 점 개수가 다른 선(j)보다 1.5배 이상 많다면 문제 있는 선으로 판단
+        if (comp_cnt >= target_limit) {
+          this->closestLines.erase(this->closestLines.begin() + l); // 오타 수정: l번째 선 제거
+          line_erased = true;
           break;
         }
       }
-      if (!check) {
+      if (line_erased)
         break;
-      }
     }
-    if (closestLines.size() < this->required_baseline_cnt) {
-      return false;
+
+    // 선을 지웠다면, 남은 선들로 처음부터 '다시 검사(Retry)' 진행하기 위해 continue
+    if (line_erased) {
+      continue;
     }
-    break;
+
+    // 모든 선의 점 개수가 정상 범주라면 결과를 저장하고 최종 성공 리턴
+    nth_closest_keypoints_on_baseline = std::move(dots_on_line);
+    return true;
   }
-  return true;
+
+  return false;
 }
 auto ImgPreprocessor::validateClosestBaseLinesByDirection() -> bool {
-  lines_dist_radian_idx_representative.resize(2);
-
-  // CrossPoint 가 선 위에 있는지 고려함.
-  this->is_crosshair_on_baseline = this->isKeyPointNearLine(
-      cv::KeyPoint(this->img_cross_point, 0), closestLines.at(0).at(0).pt1, closestLines.at(0).at(0).pt2, 1);
-  std::vector<double> lines_radians_from_imgCP;
-  size_t              idx = 0;
-  if (is_crosshair_on_baseline) {
-    lines_dist_radian_idx.emplace_back();
-    idx++;
+  // 1. 선분 데이터 추출 (인덱스 1과 2만 콕 집어서 사용)
+  // (만약의 에러를 대비해 사이즈 체크 안전장치만 살짝 넣었습니다)
+  if (closestLines.size() <= 2 || closestLines[1].empty() || closestLines[2].empty()) {
+    return false;
   }
 
-  for (size_t i = idx; i < required_baseline_cnt; i++) {
-    cv::Point2f tmp_pt =
-        getClosestPointOnLine(this->closestLines[i][0].pt1, this->closestLines[i][0].pt2, this->img_cross_point);
-    cv::Point2f temp_direction_vector = (tmp_pt - this->img_cross_point);
-    float       temp_dist             = norm(this->img_cross_point - tmp_pt);
-    double      temp_radian           = atan2(temp_direction_vector.y, temp_direction_vector.x);
-    lines_dist_radian_idx.emplace_back(temp_dist, temp_radian, i);
-    lines_radians_from_imgCP.push_back(temp_radian);
+  // 바깥 라인
+  auto line1 = closestLines[1][0];
+  auto line2 = closestLines[2][0];
+
+  cv::Point2f CP       = {static_cast<float>(img_cross_point.x), static_cast<float>(img_cross_point.y)};
+  float       dot_size = closest_dot_to_cross_point.size;
+
+  // 2. CP 기준으로 두 선에 대한 방향 벡터와 거리 계산
+  cv::Point2f closest_pt1 = getClosestPointOnLine(line1.pt1, line1.pt2, CP);
+  cv::Point2f closest_pt2 = getClosestPointOnLine(line2.pt1, line2.pt2, CP);
+
+  cv::Point2f dir1 = closest_pt1 - CP;
+  cv::Point2f dir2 = closest_pt2 - CP;
+
+  float dist1 = static_cast<float>(cv::norm(dir1));
+  float dist2 = static_cast<float>(cv::norm(dir2));
+
+  // 점이 선 위에 완벽하게 겹친 경우
+  if (dist1 < 1e-5 || dist2 < 1e-5)
+    return true;
+
+  // 3. 두 방향 벡터 사이의 각도 차이(내각) 계산
+  double angle1 = std::atan2(dir1.y, dir1.x);
+  double angle2 = std::atan2(dir2.y, dir2.x);
+
+  double angle_diff = std::abs(angle1 - angle2);
+  if (angle_diff > CV_PI) {
+    angle_diff = 2.0 * CV_PI - angle_diff; // 180도 넘어가는 겉각 대신 안쪽 내각 사용
   }
 
-  // 첫번째 라디안을 비교기준으로, 나머지 라디안 값들이 모두 같다고 판정하면 return false;
-  float lines_vector_similar_tolerence = 2.0; // 2.5 radians -> angle 143
-  float radians_compare_source         = lines_radians_from_imgCP[idx];
-  for (; idx < lines_dist_radian_idx.size(); idx++) {
+  // 4. 조건 판별 (30도 이내면 한쪽으로 쏠린 것)
+  const double SAME_DIR_THRESHOLD = 30.0 * CV_PI / 180.0;
 
-    bool representative_vector = this->isAngleSimilar(radians_compare_source, std::get<1>(lines_dist_radian_idx[idx]),
-                                                      lines_vector_similar_tolerence);
-    if (representative_vector) {
-      lines_dist_radian_idx_representative[0].push_back(lines_dist_radian_idx[idx]); // true-> 0에 삽입
-    } else {
-      lines_dist_radian_idx_representative[1].push_back(lines_dist_radian_idx[idx]); // false -> 1 에 삽입
-    }
+  if (angle_diff <= SAME_DIR_THRESHOLD) {
+    // 같은 방향으로 쏠렸지만, 둘 중 가장 가까운 선이 허용치 이내라면 true
+    return (std::min(dist1, dist2) <= dot_size);
   }
+#ifdef SHOW_VIDEO
+  cv::Mat test = src.clone(); // 원본 이미지 src를 복제하여 시각화에 사용
 
-  // crosshair를 기준, 기준선이 한쪽으로 쏠려있는 구조라면 false
-  for (const auto &line_info : lines_dist_radian_idx_representative) {
-    if (line_info.size() == required_baseline_cnt) {
-      return false;
-    }
-  }
+  // 화살표 그리기 (CP에서 각 선의 가장 가까운 점으로)
+  // Green arrow for dir1, from CP to closest_pt1
+  cv::arrowedLine(test, CP, closest_pt1, cv::Scalar(0, 255, 0), 2, 8, 0, 0.1);
+  // Red arrow for dir2, from CP to closest_pt2
+  cv::arrowedLine(test, CP, closest_pt2, cv::Scalar(0, 0, 255), 2, 8, 0, 0.1);
 
+  // 텍스트 추가 (주석 형식으로 실제 화면에 보일 수 있게)
+  cv::putText(test, "dir1 (Green line)", closest_pt1 + cv::Point2f(10, 10), cv::FONT_HERSHEY_PLAIN, 1.0,
+              cv::Scalar(0, 255, 0), 1);
+  cv::putText(test, "dir2 (Blue line)", closest_pt2 + cv::Point2f(10, -10), cv::FONT_HERSHEY_PLAIN, 1.0,
+              cv::Scalar(0, 0, 255), 1);
+
+  // 계산된 각도 차이 표시
+  std::string diff_text = "Diff: " + std::to_string((int)angle_diff) + " deg";
+  cv::putText(test, diff_text, CP + cv::Point2f(-60, 30), cv::FONT_HERSHEY_PLAIN, 1.0, cv::Scalar(255, 255, 255), 1);
+  cv::putText(test, "Blue Dot (CP)", CP + cv::Point2f(-60, 50), cv::FONT_HERSHEY_PLAIN, 1.0, cv::Scalar(255, 255, 255),
+              1);
+
+  // 시각화 창 표시 및 대기
+  cv::imshow("Validation Visualization", test);
+  cv::waitKey(0); // 사용자가 키를 누를 때까지 대기
+#endif
+
+  // 방향이 30도 이상 벌어져 있음 = 다른 방향이 나옴 = 선들 사이에 잘 있음
   return true;
 }
-
 auto ImgPreprocessor::getClosestPointOnLine(const cv::Point2f &line_start, const cv::Point2f &line_end,
                                             const cv::Point2f &P0) -> cv::Point2f {
   float dx = line_end.x - line_start.x;
@@ -363,15 +423,16 @@ auto ImgPreprocessor::findClosestBaselineDotToNearCP() -> void {
   cv::KeyPoint closestKeyPoint;
   float        minDistance = std::numeric_limits<float>::max();
 
+  if (nth_closest_keypoints_on_baseline.empty()) {
+    return;
+  }
   for (const auto &keypoint : nth_closest_keypoints_on_baseline[0]) {
     float distance = cv::norm(keypoint.pt - closest_dot_to_cross_point.pt);
-
     if (distance < minDistance) {
       minDistance     = distance;
       closestKeyPoint = keypoint;
     }
   }
-
   if (minDistance != std::numeric_limits<float>::max()) {
     closest_baseline_dot = (closestKeyPoint);
   }
@@ -390,143 +451,180 @@ void ImgPreprocessor::drawClusteredLines() {
 }
 
 auto ImgPreprocessor::findwarpPerspectiveCornerPoint() -> bool {
-
-  for (const auto &tuples : lines_dist_radian_idx_representative) {
-    Point2f temp_dot = {-1, -1};
-    if (tuples.empty()) {
-      if (!is_crosshair_on_baseline) // cross-point가 라인 위에 있었을 때
-      {                              // 라인 정보가 비어 있음 (error)
-        LBS_error_code = findwarpPerspectiveCornerPoint_fatal_error;
-        return false;
-      } else {
-        side_line_info.emplace_back(closest_baseline_dot.pt, closestLines.at(0).at(0), 0);
-        continue;
-      }
-    }
-    int         line_idx = -1;
-    cv::Point2f min_dist_dot;
-    for (const auto &tuple : tuples) {
-      if (temp_dot.x == -1) {
-        temp_dot = closest_baseline_dot.pt;
-      }
-      float min_dist = numeric_limits<float>::max();
-      line_idx       = std::get<2>(tuple);
-
-      for (const auto &ke : this->nth_closest_keypoints_on_baseline[line_idx]) {
-        float temp_dot_dist = norm(temp_dot - ke.pt);
-        if (min_dist > temp_dot_dist) {
-          min_dist     = temp_dot_dist;
-          min_dist_dot = ke.pt;
-        }
-      }
-    }
-    side_line_info.emplace_back(min_dist_dot, closestLines[line_idx][0], line_idx);
-  }
-// test cornet dots Info
-#ifdef SHOW_VIDEO
-  for (auto dot : nth_closest_keypoints_on_baseline[get<2>(side_line_info[0])]) {
-    circle(src, dot.pt, dot.size, {0, 255, 0}, -1);
-  }
-  for (auto dot : nth_closest_keypoints_on_baseline[get<2>(side_line_info[1])]) {
-    circle(src, dot.pt, dot.size * 1.2, {0, 0, 255}, -1);
-  }
-  constexpr int CP_size = 6;
-  cv::line(this->src, cv::Point(static_cast<int>(img_cross_point.x) - CP_size, static_cast<int>(img_cross_point.y)),
-           cv::Point(static_cast<int>(img_cross_point.x) + CP_size, static_cast<int>(img_cross_point.y)), {233, 233, 1},
-           1);
-  cv::line(this->src, cv::Point(static_cast<int>(img_cross_point.x), static_cast<int>(img_cross_point.y) - CP_size),
-           cv::Point(static_cast<int>(img_cross_point.x), static_cast<int>(img_cross_point.y) + CP_size), {233, 233, 1},
-           1);
-  imshow("corner dots candidate", src);
-  waitKey(1);
-#endif //! SHOW_VIDEO
-
-  // 확장 기준점으로부터 선분의 방향에 대해
-  // 얼마만큼의 확장이 필요한지의 갯수
-  int start_expansion1 = 0, end_expansion1 = 0;
-  int start_expansion2 = 0, end_expansion2 = 0;
-
-  std::vector<cv::KeyPoint> dots_to_start1, dots_to_end1;
-  std::vector<cv::KeyPoint> dots_to_start2, dots_to_end2;
-
-  for (int i = 0; i < 2; i++) {
-    if (i == 1) {
-      if ((this->two_Corner_dot_on_side_Line1.size() < 2 || this->two_Corner_dot_on_side_Line2.size() < 2)) {
-        std::swap(get<1>(side_line_info[0]).pt1, get<1>(side_line_info[0]).pt2);
-        start_expansion1 = 0, end_expansion1 = 0, start_expansion2 = 0, end_expansion2 = 0;
-        dots_to_start1.clear();
-        dots_to_end1.clear();
-        dots_to_start2.clear();
-        dots_to_end2.clear();
-      } else
-        break;
-    }
-    findCornerDotCandidates(get<1>(side_line_info[0]).pt1, get<1>(side_line_info[0]).pt2, get<0>(side_line_info[0]),
-                            nth_closest_keypoints_on_baseline[get<2>(side_line_info[0])], start_expansion1,
-                            end_expansion1, dots_to_start1, dots_to_end1);
-    findCornerDotCandidates(get<1>(side_line_info[1]).pt1, get<1>(side_line_info[1]).pt2, get<0>(side_line_info[1]),
-                            nth_closest_keypoints_on_baseline[get<2>(side_line_info[1])], start_expansion2,
-                            end_expansion2, dots_to_start2, dots_to_end2);
-
-    // 코너닷 과정
-    bool is_start_expasion = start_expansion1 != 0 || start_expansion2 != 0;
-    bool is_end_expasion   = end_expansion1 != 0 || end_expansion2 != 0;
-
-    float pt_size = 2; // 이니셜라이저 맞추기 위한 점의 크기 ,중요하지 않음
-    if (is_start_expasion) {
-      int max_exp_nums = std::max(start_expansion1, start_expansion2);
-      // 각 방향의 점이 조건에 따라 충분히 존재하는지 검사
-      bool check_start_num = dots_to_start1.size() >= (expansion_point_num) + max_exp_nums &&
-                             dots_to_start2.size() >= (expansion_point_num) + max_exp_nums;
-      bool check_end_num = dots_to_end1.size() >= (expansion_point_num)-max_exp_nums &&
-                           dots_to_end2.size() >= (expansion_point_num)-max_exp_nums;
-
-      if (check_start_num && check_end_num) // 확장점 갯수가 expansion_point_num과 같은 경우.
-      {
-        this->two_Corner_dot_on_side_Line1.push_back(dots_to_start1[max_exp_nums + (expansion_point_num)-1]);
-        this->two_Corner_dot_on_side_Line2.push_back(dots_to_start2[max_exp_nums + (expansion_point_num)-1]);
-
-        if (max_exp_nums == this->expansion_point_num) {
-          this->two_Corner_dot_on_side_Line1.push_back({get<0>(side_line_info[0]), pt_size});
-          this->two_Corner_dot_on_side_Line2.push_back({get<0>(side_line_info[1]), pt_size});
-        } else {
-          this->two_Corner_dot_on_side_Line1.push_back(dots_to_end1[(expansion_point_num)-max_exp_nums - 1]);
-          this->two_Corner_dot_on_side_Line2.push_back(dots_to_end2[(expansion_point_num)-max_exp_nums - 1]);
-        }
-      }
-    } else if (is_end_expasion) {
-      int max_exp_nums = std::max(end_expansion1, end_expansion2);
-
-      bool check_end_num = dots_to_end1.size() >= expansion_point_num + max_exp_nums &&
-                           dots_to_end2.size() >= expansion_point_num + max_exp_nums;
-      bool check_start_num = dots_to_start1.size() >= expansion_point_num - max_exp_nums &&
-                             dots_to_start2.size() >= expansion_point_num - max_exp_nums;
-      if (check_end_num && check_start_num) {
-        this->two_Corner_dot_on_side_Line1.push_back(dots_to_end1[max_exp_nums + (expansion_point_num)-1]);
-        this->two_Corner_dot_on_side_Line2.push_back(dots_to_end2[max_exp_nums + (expansion_point_num)-1]);
-        if (max_exp_nums == this->expansion_point_num) // 확장점 갯수가 expansion_point_num과 같은 경우.
-        {
-          this->two_Corner_dot_on_side_Line1.push_back({get<0>(side_line_info[0]), pt_size});
-          this->two_Corner_dot_on_side_Line2.push_back({get<0>(side_line_info[1]), pt_size});
-        } else {
-          this->two_Corner_dot_on_side_Line1.push_back(dots_to_start1[(expansion_point_num)-max_exp_nums - 1]);
-          this->two_Corner_dot_on_side_Line2.push_back(dots_to_start2[(expansion_point_num)-max_exp_nums - 1]);
-        }
-      }
-    } else {
-      // 깔끔하게 나올경우.
-      this->two_Corner_dot_on_side_Line1.push_back(dots_to_start1[(expansion_point_num)-1]);
-      this->two_Corner_dot_on_side_Line1.push_back(dots_to_end1[(expansion_point_num)-1]);
-      this->two_Corner_dot_on_side_Line2.push_back(dots_to_start2[(expansion_point_num)-1]);
-      this->two_Corner_dot_on_side_Line2.push_back(dots_to_end2[(expansion_point_num)-1]);
-    }
-  }
-
-  if (two_Corner_dot_on_side_Line1.size() < 2 || two_Corner_dot_on_side_Line2.size() < 2) {
-
+  // 1. 방어적 코드: closestLines가 최소 3개 이상 있어야 안전함
+  if (closestLines.size() < 3) {
     LBS_error_code = findwarpPerspectiveCornerPoint_sidelines_error;
     return false;
   }
+
+  std::vector<Line<int>> sideLines = {closestLines[1][0], closestLines[2][0]};
+
+// [디버그용 시각화]
+#ifdef SHOW_VIDEO
+  cv::Mat test = src.clone();
+  for (const auto &line : sideLines) {
+    cv::line(test, line.pt1, line.pt2, {0, 255, 0}, 2);
+  }
+  cv::imshow("test222", test);
+#endif
+  // 2. 각 라인별로 기준점(closest_baseline_dot)과 가장 가까운 점 찾기
+  const std::vector<int> side_line_indices = {1, 2};
+
+  for (int l_idx : side_line_indices) {
+    // 인덱스 초과 접근 방지 (안전장치)
+    if (l_idx >= closestLines.size() || l_idx >= nth_closest_keypoints_on_baseline.size()) {
+      continue;
+    }
+
+    const auto &line_group = closestLines[l_idx];
+    const auto &keypoints  = this->nth_closest_keypoints_on_baseline[l_idx];
+
+    // 라인이 비어있을 경우의 예외 처리
+    if (line_group.empty()) {
+      if (!is_crosshair_on_baseline) {
+        LBS_error_code = findwarpPerspectiveCornerPoint_fatal_error;
+        return false;
+      } else {
+        // 빈 라인인 경우 기본값 삽입 후 패스
+        side_line_info.emplace_back(closest_baseline_dot.pt, Line<int>{}, l_idx);
+        continue;
+      }
+    }
+
+    // [최적화 유지] sqrt 대신 '제곱 거리'를 이용해 기준점과 가장 가까운 점 탐색
+    float             min_dist_sq  = std::numeric_limits<float>::max();
+    cv::Point2f       min_dist_dot = closest_baseline_dot.pt;
+    const cv::Point2f target_pt    = closest_baseline_dot.pt;
+
+    for (const auto &ke : keypoints) {
+      float dx      = target_pt.x - ke.pt.x;
+      float dy      = target_pt.y - ke.pt.y;
+      float dist_sq = (dx * dx) + (dy * dy);
+
+      if (dist_sq < min_dist_sq) {
+        min_dist_sq  = dist_sq;
+        min_dist_dot = ke.pt;
+      }
+    }
+
+    // 계산된 가장 가까운 점과 라인 정보 저장
+    side_line_info.emplace_back(min_dist_dot, line_group[0], l_idx);
+  }
+
+// [디버그용 시각화] 코너 닷 후보군
+#ifdef SHOW_VIDEO
+  for (const auto &dot : nth_closest_keypoints_on_baseline[std::get<2>(side_line_info[0])]) {
+    cv::circle(src, dot.pt, dot.size, {0, 255, 0}, -1);
+  }
+  for (const auto &dot : nth_closest_keypoints_on_baseline[std::get<2>(side_line_info[1])]) {
+    cv::circle(src, dot.pt, dot.size * 1.2, {0, 0, 255}, -1);
+  }
+  constexpr int CP_size = 6;
+  cv::Point     cp(static_cast<int>(img_cross_point.x), static_cast<int>(img_cross_point.y));
+  cv::line(src, cv::Point(cp.x - CP_size, cp.y), cv::Point(cp.x + CP_size, cp.y), {233, 233, 1}, 1);
+  cv::line(src, cv::Point(cp.x, cp.y - CP_size), cv::Point(cp.x, cp.y + CP_size), {233, 233, 1}, 1);
+  cv::imshow("corner dots candidate", src);
+  cv::waitKey(0);
+#endif //! SHOW_VIDEO
+
+  if (side_line_info.size() < 2)
+    return false; // 안전 장치
+
+  // 3. 확장 점(Corner Dot) 찾기 로직 (최대 2회 재시도)
+  int                       start_expansion1 = 0, end_expansion1 = 0, start_expansion2 = 0, end_expansion2 = 0;
+  std::vector<cv::KeyPoint> dots_to_start1, dots_to_end1, dots_to_start2, dots_to_end2;
+
+  for (int retry = 0; retry < 2; retry++) {
+    // 첫 시도 실패 시 (retry == 1) 첫 번째 선분의 방향을 뒤집고 데이터 초기화 후 재시도
+    if (retry == 1) {
+      if (this->two_Corner_dot_on_side_Line1.size() >= 2 && this->two_Corner_dot_on_side_Line2.size() >= 2) {
+        break; // 이미 점을 충분히 찾았다면 루프 탈출
+      }
+
+      std::swap(std::get<1>(side_line_info[0]).pt1, std::get<1>(side_line_info[0]).pt2);
+
+      start_expansion1 = end_expansion1 = start_expansion2 = end_expansion2 = 0;
+      dots_to_start1.clear();
+      dots_to_end1.clear();
+      dots_to_start2.clear();
+      dots_to_end2.clear();
+      this->two_Corner_dot_on_side_Line1.clear();
+      this->two_Corner_dot_on_side_Line2.clear();
+    }
+
+    // 가독성을 위한 레퍼런스(참조) 변수 선언 (std::get 남발 방지)
+    auto &info1_dot  = std::get<0>(side_line_info[0]);
+    auto &info1_line = std::get<1>(side_line_info[0]);
+    auto &info1_pts  = nth_closest_keypoints_on_baseline[std::get<2>(side_line_info[0])];
+
+    auto &info2_dot  = std::get<0>(side_line_info[1]);
+    auto &info2_line = std::get<1>(side_line_info[1]);
+    auto &info2_pts  = nth_closest_keypoints_on_baseline[std::get<2>(side_line_info[1])];
+
+    findCornerDotCandidates(info1_line.pt1, info1_line.pt2, info1_dot, info1_pts, start_expansion1, end_expansion1,
+                            dots_to_start1, dots_to_end1);
+
+    findCornerDotCandidates(info2_line.pt1, info2_line.pt2, info2_dot, info2_pts, start_expansion2, end_expansion2,
+                            dots_to_start2, dots_to_end2);
+
+    // 4. 조건에 따른 점 삽입 (복잡한 조건문을 직관적으로 정리)
+    bool        is_start_expansion = (start_expansion1 != 0 || start_expansion2 != 0);
+    bool        is_end_expansion   = (end_expansion1 != 0 || end_expansion2 != 0);
+    const float pt_size            = 2.0f;
+    const int   exp_num            = this->expansion_point_num; // 타이핑 및 가독성 개선
+
+    if (is_start_expansion) {
+      int max_exp = std::max(start_expansion1, start_expansion2);
+
+      if (dots_to_start1.size() >= exp_num + max_exp && dots_to_start2.size() >= exp_num + max_exp &&
+          dots_to_end1.size() >= exp_num - max_exp && dots_to_end2.size() >= exp_num - max_exp) {
+
+        this->two_Corner_dot_on_side_Line1.push_back(dots_to_start1[max_exp + exp_num - 1]);
+        this->two_Corner_dot_on_side_Line2.push_back(dots_to_start2[max_exp + exp_num - 1]);
+
+        if (max_exp == exp_num) {
+          this->two_Corner_dot_on_side_Line1.push_back({info1_dot, pt_size});
+          this->two_Corner_dot_on_side_Line2.push_back({info2_dot, pt_size});
+        } else {
+          this->two_Corner_dot_on_side_Line1.push_back(dots_to_end1[exp_num - max_exp - 1]);
+          this->two_Corner_dot_on_side_Line2.push_back(dots_to_end2[exp_num - max_exp - 1]);
+        }
+      }
+    } else if (is_end_expansion) {
+      int max_exp = std::max(end_expansion1, end_expansion2);
+
+      if (dots_to_end1.size() >= exp_num + max_exp && dots_to_end2.size() >= exp_num + max_exp &&
+          dots_to_start1.size() >= exp_num - max_exp && dots_to_start2.size() >= exp_num - max_exp) {
+
+        this->two_Corner_dot_on_side_Line1.push_back(dots_to_end1[max_exp + exp_num - 1]);
+        this->two_Corner_dot_on_side_Line2.push_back(dots_to_end2[max_exp + exp_num - 1]);
+
+        if (max_exp == exp_num) {
+          this->two_Corner_dot_on_side_Line1.push_back({info1_dot, pt_size});
+          this->two_Corner_dot_on_side_Line2.push_back({info2_dot, pt_size});
+        } else {
+          this->two_Corner_dot_on_side_Line1.push_back(dots_to_start1[exp_num - max_exp - 1]);
+          this->two_Corner_dot_on_side_Line2.push_back(dots_to_start2[exp_num - max_exp - 1]);
+        }
+      }
+    } else {
+      // 깔끔하게 떨어지는 경우
+      if (dots_to_start1.size() >= exp_num && dots_to_end1.size() >= exp_num && dots_to_start2.size() >= exp_num &&
+          dots_to_end2.size() >= exp_num) {
+        this->two_Corner_dot_on_side_Line1.push_back(dots_to_start1[exp_num - 1]);
+        this->two_Corner_dot_on_side_Line1.push_back(dots_to_end1[exp_num - 1]);
+        this->two_Corner_dot_on_side_Line2.push_back(dots_to_start2[exp_num - 1]);
+        this->two_Corner_dot_on_side_Line2.push_back(dots_to_end2[exp_num - 1]);
+      }
+    }
+  }
+
+  // 최종 유효성 검사
+  if (two_Corner_dot_on_side_Line1.size() < 2 || two_Corner_dot_on_side_Line2.size() < 2) {
+    LBS_error_code = findwarpPerspectiveCornerPoint_sidelines_error;
+    return false;
+  }
+
   return true;
 }
 
@@ -1015,7 +1113,7 @@ void ImgPreprocessor::normalizeLinePoints(vector<Vec4i> &lines) {
 void ImgPreprocessor::setHoughPAndFindOrientLines(cv::Mat &img_ROI, std::vector<Vec4i> &lines) {
   // HoughLinesP를 위한 세팅값
   int threshold_value = 60;
-  int minLineLength   = 40;
+  int minLineLength   = 30;
   int maxLineGap      = 10;
 
   HoughLinesP(img_ROI, lines, 1, CV_PI / 180, threshold_value, minLineLength, maxLineGap);
@@ -1214,7 +1312,7 @@ auto ImgPreprocessor::checkAndCorrectOrientation() -> bool {
  * @param maxAspectRatio 점으로 인정할 최대 종횡비 (1에 가까울수록 완벽한 원, 기본값 1.5)
  * @return cv::Mat 점만 남은 결과 이미지
  */
-cv::Mat extractDots(const cv::Mat &src, double minArea = 5.0, double maxAspectRatio = 1.5) {
+cv::Mat ImgPreprocessor::extractDots(const cv::Mat &src, double minArea, double maxAspectRatio) {
   // 1. 입력 이미지가 3채널(컬러)인 경우 1채널(그레이스케일)로 변환
   cv::Mat gray;
   if (src.channels() == 3) {
@@ -1224,8 +1322,10 @@ cv::Mat extractDots(const cv::Mat &src, double minArea = 5.0, double maxAspectRa
   }
 
   // 2. 이진화 (배경은 검게, 객체는 하얗게)
-  cv::Mat binary;
-  cv::threshold(gray, binary, 0, 255, cv::THRESH_BINARY_INV | cv::THRESH_OTSU);
+  cv::Mat binary = binarizeImage(src);
+
+  // imshow("inbinary", binary);
+  // waitKey(0);
 
   // 3. 외곽선(Contour) 찾기
   std::vector<std::vector<cv::Point>> contours;
@@ -1285,6 +1385,71 @@ Mat normalizeIllumination(Mat src) {
 
   return result;
 }
+std::string ImgPreprocessor::getErrorMessage() {
+  switch (this->LBS_error_code) {
+  case SBD_error:
+    return "[Error 1] SBD_error: Simple Blob Detector initialization or detection failed.";
+
+  case findBaselines_error:
+    return "[Error 2] findBaselines_error: Failed to extract structural baselines from the image.";
+
+  case findValidLines_error:
+    return "[Error 3] findValidLines_error: Could not find valid lines satisfying the baseline criteria.";
+
+  case validateClosestBaseLines_error:
+    return "[Error 4] validateClosestBaseLines_error: Verification of the closest baselines failed.";
+
+  case findwarpPerspectiveCornerPoint_fatal_error:
+    return "[Fatal Error 5] findwarpPerspectiveCornerPoint_fatal_error: Critical failure while detecting warp "
+           "perspective corner points.";
+
+  case findwarpPerspectiveCornerPoint_sidelines_error:
+    return "[Error 6] findwarpPerspectiveCornerPoint_sidelines_error: Failed to detect side lines during corner point "
+           "estimation.";
+
+  case adjustCornersToPredefinedArea_Transform_error:
+    return "[Error 7] adjustCornersToPredefinedArea_Transform_error: Perspective transformation matrix calculation "
+           "failed during corner adjustment.";
+
+  case adjustCornersToPredefinedArea_shape_error:
+    return "[Error 8] adjustCornersToPredefinedArea_shape_error: Invalid shape or layout detected when adjusting "
+           "corners to the predefined area.";
+
+  case preprocessPointData_lackPts_error:
+    return "[Error 9] preprocessPointData_lackPts_error: Insufficient number of total points for preprocessing.";
+
+  case preprocessPointData_noMidBaseLine_dots_error:
+    return "[Error 10] preprocessPointData_noMidBaseLine_dots_error: Missing dots on the middle baseline during "
+           "preprocessing.";
+
+  case preprocessPointData_error:
+    return "[Error 11] preprocessPointData_error: General failure during point data preprocessing.";
+
+  case preprocessPointData_transform_error:
+    return "[Error 12] preprocessPointData_transform_error: Coordinate transformation failed during preprocessing.";
+
+  case excludeMarginDots_lackMidPts_error:
+    return "[Error 13] excludeMarginDots_lackMidPts_error: Cannot exclude margin dots due to insufficient middle "
+           "points.";
+
+  case orienting_LineNums_error:
+    return "[Error 14] orienting_LineNums_error: Mismatch or error in the number of lines during orientation "
+           "correction.";
+
+  case orienting_line_max_too_big_error:
+    return "[Error 15] orienting_line_max_too_big_error: Maximum line value exceeds the allowed threshold.";
+
+  case orienting_cantKnowLineDiff_error:
+    return "[Error 16] orienting_cantKnowLineDiff_error: Unable to determine the line difference for orientation.";
+
+  case orienting_lackLineNums_error:
+    return "[Error 17] orienting_lackLineNums_error: Insufficient number of lines to determine correct orientation.";
+
+  default:
+    return "[Unknown Error] Invalid error code provided.";
+  }
+}
+
 cv::Mat applyGrayMaskOverlay(const cv::Mat &src, const cv::Mat &mask, int intensity, double alpha = 0.5) {
   cv::Mat dst = src.clone();
 
@@ -1302,6 +1467,36 @@ cv::Mat applyGrayMaskOverlay(const cv::Mat &src, const cv::Mat &mask, int intens
 
   return dst;
 }
+
+void ImgPreprocessor::addDotsOnLine() {
+  if (all_detected_dots_.empty() || closestLines.empty())
+    return;
+
+  // 1. 모든 루프에서 변하지 않는 max_dist 제곱 값을 미리 계산
+  double effective_max_dist = all_detected_dots_[0].size * 1.15;
+  double max_dist_sq        = effective_max_dist * effective_max_dist;
+
+  for (auto &line : closestLines) {
+    auto &l = line[0]; // 가독성을 위해 참조 변수 지정
+
+    // 선분 고유의 값들을 내부 루프 진입 전에 딱 한 번만 계산
+    double dx = static_cast<double>(l.pt2.x - l.pt1.x); // pt2로 수정
+    double dy = static_cast<double>(l.pt2.y - l.pt1.y);
+
+    double denominator_sq    = dy * dy + dx * dx;
+    double max_dist_sq_denom = max_dist_sq * denominator_sq;
+    double line_const        = static_cast<double>(l.pt2.x) * l.pt1.y - static_cast<double>(l.pt2.y) * l.pt1.x;
+
+    // 3. 내부 루프에서는 오직 '점'과 관련된 최소한의 연산만 수행
+    for (const auto &dot : all_detected_dots_) {
+      double numerator = dy * dot.pt.x - dx * dot.pt.y + line_const;
+
+      if ((numerator * numerator) <= max_dist_sq_denom) {
+        l.dots.push_back(dot); // push_back 오버헤드가 우려된다면 아래 병렬화 참고
+      }
+    }
+  }
+}
 auto ImgPreprocessor::run(cv::Mat source) -> bool {
   // 이미지 없음
   if (source.empty()) {
@@ -1313,50 +1508,56 @@ auto ImgPreprocessor::run(cv::Mat source) -> bool {
     return false;
   };
 
-  // 조명 보정 (normalize illumination)
+  // 1-1) 조명 보정 (normalize illumination)
   gray = normalizeIllumination(this->gray);
-  // 대비 보정 (normalize contrast)
-  cv::normalize(gray, gray, 0, 255, cv::NORM_MINMAX);
+#ifdef SHOW_VIDEO
+  imshow("nomalized_light", gray);
+#endif
+  // 1-2) 대비 보정 (normalize contrast)
+  cv::normalize(gray, gray, 0, 150, cv::NORM_MINMAX);
+#ifdef SHOW_VIDEO
+  imshow("nomalized_contrast_light", this->gray);
+  cv::waitKey(0);
+#endif
+  // 1-3) findcontours 및 필터링으로 선과 잡음 제거
+  double  maxAspectRatio = 1.7;
+  cv::Mat dots_extracted = extractDots(this->gray, 7.0, maxAspectRatio);
+  dots_extracted         = ~dots_extracted;
+
+  // 1-4) 이진화
+  binarized = binarizeImage(gray);
 
 #ifdef SHOW_VIDEO
-  imshow("Enhanced", this->gray);
+  imshow("dots_extracted", dots_extracted);
+  imshow("binarized", binarized);
   cv::waitKey(0);
 #endif
 
-  cv::Mat test = extractDots(this->gray);
   // 2. Dot 검출기 생성 및 점 검출
   DotDetector dotDetector;
-  dotDetector.setupParameters(params_);
-  // dotDetector.detectBySimpleBlobDetector(this->gray, all_detected_dots_);
-  cv::Mat applied_img = test = applyGrayMaskOverlay(gray, test, 0, 1);
+  all_detected_dots_ = dotDetector.detectBylable(dots_extracted);
 
-  // imshow("applied_img", applied_img);
-  // waitKey(0);
-
-  dotDetector.detectBySimpleBlobDetector(applied_img, all_detected_dots_);
-
-  // 검출된 점 그리기 (디버깅용)
+  // 선그리기
   drawDetectedDots(this->src, all_detected_dots_);
+
+  // 찾은 점이 필요 갯수 이하 시 예외 처리
   constexpr int required_min_dots = 49; // 7X7 기준
   if (all_detected_dots_.size() < required_min_dots) {
     LBS_error_code = SBD_error;
     return false;
   }
-  // imshow("test", test);
-  // waitKey(0);
 
-  // 3. 이미지 이진화, adatptive thresholding 적용
-  this->binarizeImage();
-
-  // 4. 이미지에서 검출된 점들을 지우기 (선 검출에 방해가 될 수 있기 때문)
+  // 3. 선 검출에 방해가 되는 점 제거
   eraseDetectedDots(binarized, all_detected_dots_);
 
-  // 에지 검출
+  // 엣지 검출
   cv::Canny(binarized, edge, 0, 0);
 
+  // 선 검출
   if (!lineProcessor_.detectBaseLines(edge)) {
     return false;
   }
+
   clustered_lines = lineProcessor_.getClusteredLines();
 
   // 검출된 선분 그리기
@@ -1367,30 +1568,88 @@ auto ImgPreprocessor::run(cv::Mat source) -> bool {
     cv::circle(src, closest_dot_to_cross_point.pt, 5, cv::Scalar(255, 20, 5), -1);
   }
 
+  ///////////////////////////////////////////////
+  // 선 위에 점이 기대보다 적은 라인 필터링
+
+  addDotsOnLine();
+
+  this->findValidLinesByDotsLocation();
+
   // 이미지 중앙에서 가장 가까운점을 기준으로 선분을 정렬
   this->orderBaseLinesByClosestDot();
 
-  //
-
-  this->findValidLinesByDotsLocation();
+#ifdef SHOW_VIDEO
+  cv::Mat    temp_src = this->src.clone();
+  cv::Scalar color(255, 0, 0);  // 제일가까운 B
+  cv::Scalar color2(0, 255, 0); // 두번째로 가까운 G
+  cv::Scalar color3(0, 0, 255); // 세번째로 가까운 R
+  for (int i = 0; i < closestLines.size(); i++) {
+    for (const auto &line : closestLines[i]) {
+      if (i == 0) {
+        cv::line(temp_src, line.pt1, line.pt2, color, 2);
+      } else if (i == 1) {
+        cv::line(temp_src, line.pt1, line.pt2, color2, 2);
+      } else if (i == 2) {
+        cv::line(temp_src, line.pt1, line.pt2, color3, 2);
+      }
+    }
+  }
+  imshow("orderBaseLinesByClosestDot", temp_src);
+  waitKey(0);
+#endif
 
   if (!this->findValidLinesByDotsNum()) {
     LBS_error_code = findValidLines_error;
     return false;
   }
 
-  //////////
+#ifdef SHOW_VIDEO
+  {
+    // cv::Mat    after_findValidLinesByDotsNum = this->src.clone();
+    // cv::Scalar color(255, 0, 0);  // 제일가까운 B
+    // cv::Scalar color2(0, 255, 0); // 두번째로 가까운 G
+    // cv::Scalar color3(0, 0, 255); // 세번째로 가까운 R
+    // for (int i = 0; i < closestLines.size(); i++) {
+    //   for (const auto &line : closestLines[i]) {
+    //     if (i == 0) {
+    //       cv::line(after_findValidLinesByDotsNum, line.pt1, line.pt2, color, 2);
+    //     } else if (i == 1) {
+    //       cv::line(after_findValidLinesByDotsNum, line.pt1, line.pt2, color2, 2);
+    //     } else if (i == 2) {
+    //       cv::line(after_findValidLinesByDotsNum, line.pt1, line.pt2, color3, 2);
+    //     }
+    //   }
+    // }
+    // imshow("after_findValidLinesByDotsNum", after_findValidLinesByDotsNum);
+    // cv::waitKey(0);
+  }
+#endif
 
   if (!this->validateClosestBaseLinesByDirection()) {
     this->LBS_error_code = validateClosestBaseLines_error;
     return false;
   }
 
-  this->findClosestBaselineDotToNearCP();
+  this->findClosestBaselineDotToNearCP(); // okay
+
+#ifdef SHOW_VIDEO
+  cv::Mat baseline_dot_closest = src.clone();
+  cv::circle(baseline_dot_closest, closest_baseline_dot.pt, 6, {255, 22, 100}, 4);
+  imshow("baseline_closest_dot", baseline_dot_closest);
+  cv::waitKey(0);
+#endif
 
   if (!this->findwarpPerspectiveCornerPoint()) {
     return false;
   }
+#ifdef SHOW_VIDEO
+  cv::Mat after_findwarpPerspectiveCornerPoint = src.clone();
+  for (const auto &line : side_line_info) {
+    cv::line(after_findwarpPerspectiveCornerPoint, get<1>(line).pt1, get<1>(line).pt2, {255, 0, 0}, 2);
+  }
+  cv::imshow("after_findwarpPerspectiveCornerPoint", after_findwarpPerspectiveCornerPoint);
+  cv::waitKey(0);
+#endif
 
   // 검출된 코너점 그리기
   this->drawDetectedCornerDots();

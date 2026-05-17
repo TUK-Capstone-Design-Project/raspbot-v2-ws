@@ -22,7 +22,7 @@ public:
         // 생성자에서는 파라미터 초기화만 수행
         width_               = 1280;
         height_              = 720;
-        fps_                 = 60;
+        fps_                 = 120;
         new_frame_available_ = false;
     }
 

@@ -6,22 +6,38 @@ DriverNode::DriverNode() : Node("driver_node"), x_(0.0), y_(0.0), th_(0.0), vx_(
 
   // ── 모터 튜닝 파라미터 (ros2 param set 으로 런타임 조정) ──────────────
   // PWM = round(wheel_speed_m_per_s * speed_scale)
+  // K = L + W (m). 과회전 시 줄이고, 과소회전 시 늘린다. 기본값 0.30
+  this->declare_parameter<double>("wheel_rotation_k", 0.327);
   this->declare_parameter<double>("speed_scale", 40.0);
   // 0 < |PWM| < min_pwm 인 경우 ±min_pwm 으로 끌어올려 정지마찰 보상
   this->declare_parameter<int>("min_pwm", 15);
   // |PWM| < pwm_deadzone 이면 0 으로 무시 (지터 방지)
-  this->declare_parameter<int>("pwm_deadzone", 5);
+  this->declare_parameter<int>("pwm_deadzone", 1);
   this->declare_parameter<int>("max_pwm", 255);
+  // 듀티 변조 시 연속 ON 유지 틱 수 (×100ms). 크면 stutter ↑ 회전량 ↑.
+  this->declare_parameter<int>("modulation_pulse_ticks", 5);
+  // 변조 모드 게인 (성분별 분리). gain = 1 / (실제/명령 비율).
+  // 선속도는 startup 손실 ↑ → gain > 1 로 보정. 각속도는 비선형 과출력 → gain < 1.
+  this->declare_parameter<double>("linear_gain",  1.5);
+  this->declare_parameter<double>("angular_gain", 0.64);
+  // cmd_vel 미수신 허용 시간. Nav2 컨트롤러가 10Hz를 못 맞춰 cmd_vel 간격이
+  // 들쭉날쭉할 때 너무 짧으면 stop이 반복 발동되어 끊김 현상이 생긴다.
+  this->declare_parameter<double>("cmd_timeout", 0.1);
 
   // 초기값 적용
+  robot_->K_           = this->get_parameter("wheel_rotation_k").as_double();
   robot_->speed_scale_ = this->get_parameter("speed_scale").as_double();
   robot_->min_pwm_     = this->get_parameter("min_pwm").as_int();
   robot_->pwm_deadzone_= this->get_parameter("pwm_deadzone").as_int();
   robot_->max_pwm_     = this->get_parameter("max_pwm").as_int();
+  robot_->modulation_pulse_ticks_ = this->get_parameter("modulation_pulse_ticks").as_int();
+  robot_->linear_gain_            = this->get_parameter("linear_gain").as_double();
+  robot_->angular_gain_           = this->get_parameter("angular_gain").as_double();
+  cmd_timeout_         = this->get_parameter("cmd_timeout").as_double();
   RCLCPP_INFO(this->get_logger(),
-              "Motor params: speed_scale=%.1f, min_pwm=%d, deadzone=%d, max_pwm=%d",
-              robot_->speed_scale_, robot_->min_pwm_,
-              robot_->pwm_deadzone_, robot_->max_pwm_);
+              "Motor params: K=%.3f, speed_scale=%.1f, min_pwm=%d, deadzone=%d, max_pwm=%d, cmd_timeout=%.2fs",
+              robot_->K_, robot_->speed_scale_, robot_->min_pwm_,
+              robot_->pwm_deadzone_, robot_->max_pwm_, cmd_timeout_);
 
   // 런타임 변경 (`ros2 param set /driver_node min_pwm 90` 등) 즉시 반영
   param_cb_handle_ = this->add_on_set_parameters_callback(
@@ -29,15 +45,20 @@ DriverNode::DriverNode() : Node("driver_node"), x_(0.0), y_(0.0), th_(0.0), vx_(
         rcl_interfaces::msg::SetParametersResult res;
         res.successful = true;
         for (const auto &p : params) {
-          if (p.get_name() == "speed_scale")   robot_->speed_scale_ = p.as_double();
+          if (p.get_name() == "wheel_rotation_k") robot_->K_           = p.as_double();
+          else if (p.get_name() == "speed_scale")  robot_->speed_scale_ = p.as_double();
           else if (p.get_name() == "min_pwm")      robot_->min_pwm_     = p.as_int();
           else if (p.get_name() == "pwm_deadzone") robot_->pwm_deadzone_= p.as_int();
           else if (p.get_name() == "max_pwm")      robot_->max_pwm_     = p.as_int();
+          else if (p.get_name() == "modulation_pulse_ticks") robot_->modulation_pulse_ticks_ = p.as_int();
+          else if (p.get_name() == "linear_gain")            robot_->linear_gain_            = p.as_double();
+          else if (p.get_name() == "angular_gain")           robot_->angular_gain_           = p.as_double();
+          else if (p.get_name() == "cmd_timeout")  cmd_timeout_         = p.as_double();
         }
         RCLCPP_INFO(this->get_logger(),
-                    "Motor params updated: speed_scale=%.1f, min_pwm=%d, deadzone=%d, max_pwm=%d",
-                    robot_->speed_scale_, robot_->min_pwm_,
-                    robot_->pwm_deadzone_, robot_->max_pwm_);
+                    "Motor params updated: K=%.3f, speed_scale=%.1f, min_pwm=%d, deadzone=%d, max_pwm=%d, cmd_timeout=%.2fs",
+                    robot_->K_, robot_->speed_scale_, robot_->min_pwm_,
+                    robot_->pwm_deadzone_, robot_->max_pwm_, cmd_timeout_);
         return res;
       });
 
@@ -56,6 +77,12 @@ DriverNode::DriverNode() : Node("driver_node"), x_(0.0), y_(0.0), th_(0.0), vx_(
   last_command_time_ = this->get_clock()->now();
   timeout_timer_ = this->create_wall_timer(
       std::chrono::milliseconds(50), std::bind(&DriverNode::check_timeout, this));
+
+  // 모터 출력 타이머 (10Hz, 100ms 주기). drive()가 저장한 의도 PWM을 펄스 변조해 I2C로 전송.
+  // 100ms 펄스는 DC 모터의 startup 시정수(수십 ms)를 충분히 초과해 정지마찰을 매번 깰 수 있다.
+  // 더 짧으면(20ms) 코일에 전류는 흐르지만 회전 시작 전에 OFF되어 소리만 나고 안 움직임.
+  motor_timer_ = this->create_wall_timer(
+      std::chrono::milliseconds(100), [this]() { robot_->tick(); });
 }
 
 void DriverNode::cmd_vel_callback(const geometry_msgs::msg::Twist::SharedPtr msg) {
@@ -65,6 +92,7 @@ void DriverNode::cmd_vel_callback(const geometry_msgs::msg::Twist::SharedPtr msg
     return;
   }
   last_command_time_ = this->get_clock()->now();
+  timed_out_ = false;  // 새 명령 도착 — 타임아웃 상태 해제
 
   vx_ = msg->linear.x;
   vy_ = msg->linear.y;
@@ -142,8 +170,12 @@ void DriverNode::update_odometry() {
 }
 
 void DriverNode::check_timeout() {
-  if ((this->get_clock()->now() - last_command_time_).seconds() > TIMEOUT_THRESHOLD_) {
+  if (timed_out_) return;  // 이미 정지 상태면 I²C로 stop 중복 전송 안 함
+  if ((this->get_clock()->now() - last_command_time_).seconds() > cmd_timeout_) {
     vx_ = 0.0; vy_ = 0.0; wz_ = 0.0;
     robot_->stop();
+    timed_out_ = true;
+    RCLCPP_WARN(this->get_logger(),
+                "cmd_vel 미수신 %.2fs 초과 — 모터 정지", cmd_timeout_);
   }
 }

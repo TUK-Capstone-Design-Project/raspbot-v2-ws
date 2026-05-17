@@ -70,7 +70,7 @@ private:
     void broadcast(const json &msg);
 
     // Nav2 액션
-    void send_nav_goal(double x, double y, double theta);
+    void send_nav_goal(double x, double y);
     void on_goal_response(
         rclcpp_action::ClientGoalHandle<NavigateToPose>::SharedPtr goal_handle
     );

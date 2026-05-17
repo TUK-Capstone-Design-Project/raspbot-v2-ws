@@ -21,6 +21,7 @@ private:
   std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
   rclcpp::TimerBase::SharedPtr timeout_timer_;
   rclcpp::TimerBase::SharedPtr odom_timer_;
+  rclcpp::TimerBase::SharedPtr motor_timer_;  // 50Hz: KinematicsInterface::tick() 호출
   rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr param_cb_handle_;
 
   // 하드웨어 인터페이스
@@ -31,7 +32,8 @@ private:
   double vx_, vy_, wz_;         // 현재 명령된 속도
   rclcpp::Time last_command_time_;
   rclcpp::Time last_odom_time_;
-  const double TIMEOUT_THRESHOLD_ = 0.5;
+  double cmd_timeout_;       // cmd_vel 미수신 허용 시간 (초). 파라미터로 조정.
+  bool timed_out_{false};    // 타임아웃 stop이 이미 발동됐는지 — 중복 stop 방지.
 };
 
 #endif

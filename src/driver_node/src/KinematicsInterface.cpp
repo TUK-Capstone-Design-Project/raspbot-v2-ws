@@ -95,7 +95,7 @@ int KinematicsInterface::set_motor(int id, int speed) {
 
 void KinematicsInterface::drive(double vx, double vy, double wz) {
   if (is_simulation_) {
-    // 시뮬레이션 모드: Gazebo용 Twist 메시지 발행
+    // 시뮬레이션 모드: Gazebo용 Twist 메시지 발행 (펄스 변조 없음)
     geometry_msgs::msg::Twist msg;
     msg.linear.x = vx;
     msg.linear.y = vy;
@@ -115,37 +115,112 @@ void KinematicsInterface::drive(double vx, double vy, double wz) {
   }
 
   // [메카넘 휠 역기구학 공식]
-  // K = L + W (회전 계수)
-  double fl = vx - vy - (K_ * wz);
-  double fr = vx + vy + (K_ * wz);
-  double rl = vx + vy - (K_ * wz);
-  double rr = vx - vy + (K_ * wz);
+  // K = L + W (회전 계수). 선속도(vx,vy)와 각속도(wz) 성분을 분리해 저장.
+  // 변조 모드에서 성분별로 다른 게인을 적용하기 위함.
+  double fl_lin = (vx - vy) * speed_scale_;
+  double fr_lin = (vx + vy) * speed_scale_;
+  double rl_lin = (vx + vy) * speed_scale_;
+  double rr_lin = (vx - vy) * speed_scale_;
+  double fl_ang = -K_ * wz * speed_scale_;
+  double fr_ang =  K_ * wz * speed_scale_;
+  double rl_ang = -K_ * wz * speed_scale_;
+  double rr_ang =  K_ * wz * speed_scale_;
 
-  // 명령 PWM (round 적용)
-  int p_fl_cmd = static_cast<int>(std::round(fl * speed_scale_));
-  int p_fr_cmd = static_cast<int>(std::round(fr * speed_scale_));
-  int p_rl_cmd = static_cast<int>(std::round(rl * speed_scale_));
-  int p_rr_cmd = static_cast<int>(std::round(rr * speed_scale_));
-
-  // 실제로 모터에 들어간 PWM (clamp/deadband/min_pwm 보정 후)
   // ID 매핑: 0=FL, 1=RL, 2=FR, 3=RR
-  int p_fl = set_motor(0, p_fl_cmd);
-  int p_rl = set_motor(1, p_rl_cmd);
-  int p_fr = set_motor(2, p_fr_cmd);
-  int p_rr = set_motor(3, p_rr_cmd);
+  intended_linear_pwm_[0]  = fl_lin;
+  intended_linear_pwm_[1]  = rl_lin;
+  intended_linear_pwm_[2]  = fr_lin;
+  intended_linear_pwm_[3]  = rr_lin;
+  intended_angular_pwm_[0] = fl_ang;
+  intended_angular_pwm_[1] = rl_ang;
+  intended_angular_pwm_[2] = fr_ang;
+  intended_angular_pwm_[3] = rr_ang;
+  // 연속 모드 판단 및 출력에 쓰이는 raw 합산값
+  intended_pwm_[0] = fl_lin + fl_ang;
+  intended_pwm_[1] = rl_lin + rl_ang;
+  intended_pwm_[2] = fr_lin + fr_ang;
+  intended_pwm_[3] = rr_lin + rr_ang;
 
-  // PWM → 휠 선속도(m/s) 역산. speed_scale 자체의 비선형성은 못 잡지만,
-  // 적어도 deadband/min_pwm 보정으로 인한 양자화는 정직하게 반영됨.
-  const double inv_scale = (speed_scale_ != 0.0) ? (1.0 / speed_scale_) : 0.0;
-  double wfl = p_fl * inv_scale;
-  double wfr = p_fr * inv_scale;
-  double wrl = p_rl * inv_scale;
-  double wrr = p_rr * inv_scale;
+  // odom용 effective 속도: tick()의 펄스 변조 평균이 의도 PWM과 일치하므로
+  // 의도값 그대로 사용. 단, |의도| < deadzone 인 휠은 실제로 못 움직이므로 0으로 반영.
+  auto eff_wheel = [this](double p) {
+    return (std::abs(p) < pwm_deadzone_) ? 0.0 : p / speed_scale_;
+  };
+  double wfl = eff_wheel(intended_pwm_[0]);
+  double wrl = eff_wheel(intended_pwm_[1]);
+  double wfr = eff_wheel(intended_pwm_[2]);
+  double wrr = eff_wheel(intended_pwm_[3]);
 
   // 메카넘 정기구학: 휠 속도 → 로봇 좌표계 속도
   effective_vx_ = ( wfl + wfr + wrl + wrr) / 4.0;
   effective_vy_ = (-wfl + wfr + wrl - wrr) / 4.0;
   effective_wz_ = (-wfl + wfr - wrl + wrr) / (4.0 * K_);
+}
+
+void KinematicsInterface::tick() {
+  if (is_simulation_ || fd_ < 0) return;
+
+  for (int i = 0; i < 4; ++i) {
+    double intended = intended_pwm_[i];
+    double abs_intended = std::abs(intended);
+
+    if (abs_intended >= min_pwm_) {
+      // 충분히 큰 PWM — 그대로 출력 (연속 모드)
+      set_motor(i, static_cast<int>(std::round(intended)));
+      accumulator_[i] = 0.0;
+      pulse_remaining_[i] = 0;
+      was_modulating_[i] = false;
+      continue;
+    }
+
+    // 변조 모드 후보: 성분별 게인 가중합 계산
+    // (deadzone 체크를 weighted 기준으로 해야 게인이 작은 raw intended 도 살릴 수 있다)
+    double weighted = intended_linear_pwm_[i]  * linear_gain_
+                    + intended_angular_pwm_[i] * angular_gain_;
+
+    // |weighted| > min_pwm 이면 누산기 발산 → ±min_pwm 으로 캡 (실효적 100% 듀티).
+    if (std::abs(weighted) > min_pwm_) {
+      weighted = (weighted > 0 ? 1 : -1) * static_cast<double>(min_pwm_);
+    }
+    double abs_weighted = std::abs(weighted);
+
+    if (abs_weighted < pwm_deadzone_) {
+      // weighted 도 deadzone 미만이면 진짜 무의미한 명령 — 정지
+      set_motor(i, 0);
+      accumulator_[i] = 0.0;
+      pulse_remaining_[i] = 0;
+      was_modulating_[i] = false;
+      continue;
+    }
+
+    // 변조 모드 진입. 펄스 방향은 weighted 부호 기준 (실제 actuate 방향과 일치).
+    int sign = (weighted > 0) ? 1 : -1;
+
+    // Kickstart: 모듈레이션 모드 첫 진입 시 누산기를 threshold로 미리 채워
+    // 첫 펄스 발사 지연 (large pulse_ticks에서 수 초 걸릴 수 있음)을 제거.
+    if (!was_modulating_[i]) {
+      accumulator_[i] = sign * static_cast<double>(min_pwm_) * modulation_pulse_ticks_;
+      was_modulating_[i] = true;
+    }
+    accumulator_[i] += weighted;
+
+    if (pulse_remaining_[i] > 0) {
+      // 진행 중인 펄스 트레인 — 계속 ON
+      set_motor(i, sign * min_pwm_);
+      pulse_remaining_[i]--;
+    } else {
+      double threshold = static_cast<double>(min_pwm_) * modulation_pulse_ticks_;
+      if (std::abs(accumulator_[i]) >= threshold) {
+        // 새 펄스 트레인 시작 (첫 틱은 지금 ON, 나머지 (N-1)틱은 다음 호출에서)
+        sign = (accumulator_[i] > 0) ? 1 : -1;
+        set_motor(i, sign * min_pwm_);
+        accumulator_[i] -= sign * threshold;
+        pulse_remaining_[i] = modulation_pulse_ticks_ - 1;
+      } else {
+        set_motor(i, 0);
+      }
+    }
+  }
 }
 
 void KinematicsInterface::get_effective_velocity(double &vx, double &vy, double &wz) const {

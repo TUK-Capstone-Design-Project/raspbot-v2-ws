@@ -29,9 +29,6 @@ private:
   bool is_simulation_ = false; // 시뮬레이션 모드 플래그
 
   // 로봇 물리 파라미터 (단위: m)
-  const double L_ = 0.15;
-  const double W_ = 0.15;
-  const double K_ = L_ + W_; // 회전 계수
 
   // drive() 호출 시 모터에 *실제로 들어간* PWM (clamp/deadband 통과 후) 기반으로
   // 메카넘 정기구학으로 역산한 로봇 좌표계 effective 속도.
@@ -40,8 +37,29 @@ private:
   double effective_vy_ = 0.0;
   double effective_wz_ = 0.0;
 
+  // 휠별 의도 PWM (drive()가 매번 갱신). tick()이 이 값을 보고 펄스 변조한다.
+  // ID 매핑: 0=FL, 1=RL, 2=FR, 3=RR (set_motor와 동일)
+  double intended_pwm_[4] = {0.0, 0.0, 0.0, 0.0};
+
+  // 의도 PWM의 선속도/각속도 성분 분리. 변조 모드에서 성분별 게인 가중합에 사용.
+  double intended_linear_pwm_[4]  = {0.0, 0.0, 0.0, 0.0};
+  double intended_angular_pwm_[4] = {0.0, 0.0, 0.0, 0.0};
+
+  // Bresenham 듀티 변조 누산기. |intended| < min_pwm 일 때만 사용.
+  double accumulator_[4] = {0.0, 0.0, 0.0, 0.0};
+
+  // 연속 펄스 잔여 틱 수. 펄스를 여러 틱 연속 ON 유지해서 모터 startup 손실을 줄임.
+  int pulse_remaining_[4] = {0, 0, 0, 0};
+
+  // 이전 tick에서 듀티 변조 모드였는지. false→true 전환 시 누산기 kickstart로 첫 펄스 즉시 발사.
+  bool was_modulating_[4] = {false, false, false, false};
+
 public:
   // ── 모터 튜닝 파라미터 (ROS param 으로 주입; 런타임 조정 가능) ─────────
+  // 회전 계수 K = L + W (바퀴 배치 기반). 로봇이 과회전하면 줄이고, 과소회전하면 늘린다.
+  // 캘리브레이션: wz=1.0으로 T초 회전 후 실제 각도 A(rad)를 측정하면 K_new = K_old × (1.0 / (A/T))
+  double K_ = 0.327;
+
   // 속도 변환 계수 (m/s -> PWM). PWM = round(wheel_speed * speed_scale_)
   double speed_scale_ = 40.0;
 
@@ -54,6 +72,16 @@ public:
 
   // 상한 (드라이버 보호)
   int max_pwm_ = 255;
+
+  // |intended| < min_pwm 일 때 연속 ON 유지할 틱 수. 늘리면 모터 startup 손실 ↓, stutter ↑.
+  // 평균 출력(=intended)은 그대로 유지된다 (idle 시간이 비례해서 늘어남).
+  int modulation_pulse_ticks_ = 5;
+
+  // 듀티 변조 모드에서 성분별로 적용하는 게인. 모터 비선형성 + 비대칭 startup 손실 보정용.
+  // 회전과 선속도의 startup 효율이 매우 다를 수 있어 분리. R = 실제/명령, gain = 1/R.
+  // 누산기에 가중합: weighted = linear_pwm × linear_gain + angular_pwm × angular_gain
+  double linear_gain_  = 1.5;   // 선속도 성분 게인. 보통 > 1 (translation under-rotation 보정)
+  double angular_gain_ = 0.64;  // 각속도 성분 게인. 보통 < 1 (rotation over-rotation 보정)
 private:
 
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr sim_pub_;
@@ -101,6 +129,13 @@ public:
    * @brief 모든 구동 정지
    */
   void stop();
+
+  /**
+   * @brief 모터 출력 펄스 변조 타이머 콜백 (DriverNode에서 50Hz로 호출).
+   *        |intended_pwm| < min_pwm 인 휠은 Bresenham 누산으로 펄스 변조하여
+   *        평균 출력이 의도값과 일치하도록 한다. 정지마찰 회피와 저속 정밀도를 동시에 확보.
+   */
+  void tick();
 
   /**
    * @brief I2C 통신 연결 상태 확인

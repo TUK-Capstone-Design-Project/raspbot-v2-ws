@@ -180,10 +180,9 @@ void AppBridgeNode::on_client_message(
         auto type = msg.value("type", "");
 
         if (type == "navigate") {
-            double x     = msg.at("x").get<double>();
-            double y     = msg.at("y").get<double>();
-            double theta = msg.value("theta", 0.0);
-            send_nav_goal(x, y, theta);
+            double x = msg.at("x").get<double>();
+            double y = msg.at("y").get<double>();
+            send_nav_goal(x, y);
         } else if (type == "cancel") {
             nav_client_->async_cancel_all_goals();
             RCLCPP_INFO(this->get_logger(), "Navigation cancelled by app");
@@ -213,7 +212,7 @@ void AppBridgeNode::broadcast(const json &msg)
 
 // ── Nav2 액션 ──────────────────────────────────────────
 
-void AppBridgeNode::send_nav_goal(double x, double y, double theta)
+void AppBridgeNode::send_nav_goal(double x, double y)
 {
     if (!nav_client_->wait_for_action_server(std::chrono::seconds(2))) {
         RCLCPP_ERROR(this->get_logger(), "Nav2 action server not available");
@@ -224,26 +223,26 @@ void AppBridgeNode::send_nav_goal(double x, double y, double theta)
         return;
     }
 
+    // 도착 방향은 강제하지 않음 (yaw_goal_tolerance = π).
+    // orientation은 identity를 전달.
     NavigateToPose::Goal goal;
     goal.pose.header.frame_id    = "map";
     goal.pose.header.stamp       = this->now();
     goal.pose.pose.position.x    = x;
     goal.pose.pose.position.y    = y;
-    goal.pose.pose.orientation.z = std::sin(theta / 2.0);
-    goal.pose.pose.orientation.w = std::cos(theta / 2.0);
+    goal.pose.pose.orientation.w = 1.0;
 
     auto send_opts = rclcpp_action::Client<NavigateToPose>::SendGoalOptions();
     send_opts.result_callback =
         [this](const auto &result) { on_goal_result(result); };
 
     nav_client_->async_send_goal(goal, send_opts);
-    RCLCPP_INFO(this->get_logger(), "Nav goal sent: (%.2f, %.2f, %.2f)", x, y, theta);
+    RCLCPP_INFO(this->get_logger(), "Nav goal sent: (%.2f, %.2f)", x, y);
 
     broadcast({
-        {  "type", "nav_accepted" },
-        {     "x",              x },
-        {     "y",              y },
-        { "theta",          theta }
+        { "type", "nav_accepted" },
+        {    "x",              x },
+        {    "y",              y }
     });
 }
 

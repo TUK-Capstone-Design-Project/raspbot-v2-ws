@@ -64,6 +64,7 @@ EOF
 echo "--- [$DOCKER_CMD] 컨테이너 실행 시작"
 $DOCKER_CMD run -dt \
     --name $CONTAINER_NAME \
+    --restart unless-stopped \
     --label devcontainer.metadata="$DEV_METADATA" \
     --privileged=true \
     --net=host \

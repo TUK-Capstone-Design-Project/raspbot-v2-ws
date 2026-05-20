@@ -60,29 +60,42 @@ DEV_METADATA=$(cat << EOF | tr -d '\n' | tr -s ' '
 EOF
 )
 
-# 컨테이너 실행 (백그라운드 -d 모드)
-echo "--- [$DOCKER_CMD] 컨테이너 실행 시작"
-$DOCKER_CMD run -dt \
-    --name $CONTAINER_NAME \
-    --restart unless-stopped \
-    --label devcontainer.metadata="$DEV_METADATA" \
-    --privileged=true \
-    --net=host \
-    --env="DISPLAY=$DISPLAY" \
-    --env="QT_X11_NO_MITSHM=1" \
-    --env="XAUTHORITY=$XAUTH" \
-    -v "$XAUTH:$XAUTH" \
-    -v /tmp/.X11-unix:/tmp/.X11-unix:rw \
-    -v /dev/dri:/dev/dri \
-    --security-opt apparmor:unconfined \
-    -v /home/pi/temp:/root/temp \
-    -v /dev:/dev \
-    -v /run/udev:/run/udev:ro \
-    -v "$PROJECT_DIR:${WORKSPACE_DIR}$VOL_OPTS" \
-    -w ${WORKSPACE_DIR} \
-    $GPU_OPTS \
-    $EXTRA_OPTS \
+# AUTO_START=true 이면 ROS 런치 명령을 포어그라운드로 실행,
+# false 이면 백그라운드(-dt) 모드로 실행
+DEMO_MODE="false" # 실제 데모 시 true로 변경
+
+COMMON_OPTS=(
+    --name $CONTAINER_NAME
+    --restart unless-stopped
+    --label devcontainer.metadata="$DEV_METADATA"
+    --privileged=true
+    --net=host
+    --env="DISPLAY=$DISPLAY"
+    --env="QT_X11_NO_MITSHM=1"
+    --env="XAUTHORITY=$XAUTH"
+    -v "$XAUTH:$XAUTH"
+    -v /tmp/.X11-unix:/tmp/.X11-unix:rw
+    -v /dev/dri:/dev/dri
+    --security-opt apparmor:unconfined
+    -v /home/pi/temp:/root/temp
+    -v /dev:/dev
+    -v /run/udev:/run/udev:ro
+    -v "$PROJECT_DIR:${WORKSPACE_DIR}$VOL_OPTS"
+    -w ${WORKSPACE_DIR}
+    $GPU_OPTS
+    $EXTRA_OPTS
     $IMAGE_NAME:$IMAGE_TAG
+)
+
+echo "--- [$DOCKER_CMD] 컨테이너 실행 시작 (DEMO_MODE=$DEMO_MODE)"
+if [ "$DEMO_MODE" = "true" ]; then
+    $DOCKER_CMD run \
+        "${COMMON_OPTS[@]}" \
+        /bin/bash -lc "su - developer -c 'cd ~/workspace && source /opt/ros/humble/setup.bash && source ~/workspace/install/setup.bash && ros2 launch lcode_localizer robot.launch.py'"
+else
+    $DOCKER_CMD run -dt \
+        "${COMMON_OPTS[@]}"
+fi
 
 echo "--- 컨테이너 '$CONTAINER_NAME' 실행 완료"
 echo "'enter-container.sh' 스크립트를 통해 컨테이너에 접속할 수 있습니다."

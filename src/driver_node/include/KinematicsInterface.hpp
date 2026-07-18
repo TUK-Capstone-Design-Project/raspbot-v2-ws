@@ -31,7 +31,7 @@ private:
 
     // 로봇 물리 파라미터 (단위: m)
 
-    // drive() 호출 시 모터에 *실제로 들어간* PWM (clamp/deadband 통과 후) 기반으로
+    // tick() 호출 시 모터에 *실제로 들어간* PWM (clamp/deadband/min/max 통과 후) 기반으로
     // 메카넘 정기구학으로 역산한 로봇 좌표계 effective 속도.
     // odom 적분은 명령값(vx/vy/wz)이 아니라 이 값을 써야 거짓말이 줄어듦.
     double effective_vx_ = 0.0;
@@ -110,8 +110,8 @@ public:
     int set_motor(int id, int speed);
 
     /**
-     * @brief 마지막 drive() 호출에서 clamp 후 실제로 적용된 effective 속도 조회.
-     *        cmd_vel(명령)이 아니라 모터에 진짜로 박힌 PWM 기반이므로 odom 적분 용도.
+     * @brief 마지막 motor tick에서 실제로 적용된 effective 속도 조회.
+     *        cmd_vel(명령)이 아니라 모터에 진짜로 기록된 PWM 기반이므로 odom 적분 용도.
      */
     void get_effective_velocity(double &vx, double &vy, double &wz) const;
 

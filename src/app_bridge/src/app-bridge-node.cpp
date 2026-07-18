@@ -1,6 +1,7 @@
 #include "app_bridge/app-bridge-node.hpp"
 
 #include <cmath>
+#include <stdexcept>
 #include <tf2/utils.h>
 
 namespace app_bridge
@@ -102,8 +103,19 @@ AppBridgeNode::AppBridgeNode(const rclcpp::NodeOptions &options) : Node("app_bri
     // 파라미터 선언
     this->declare_parameter("port", 5000);
     this->declare_parameter("pose_publish_hz", 2.0);
-    port_            = this->get_parameter("port").as_int();
-    pose_publish_hz_ = this->get_parameter("pose_publish_hz").as_double();
+    this->declare_parameter("final_validation_tolerance_m", 0.03);
+    this->declare_parameter("final_validation_timeout_sec", 2.0);
+    this->declare_parameter("final_validation_max_retries", 2);
+    port_                         = this->get_parameter("port").as_int();
+    pose_publish_hz_              = this->get_parameter("pose_publish_hz").as_double();
+    final_validation_tolerance_m_ = this->get_parameter("final_validation_tolerance_m").as_double();
+    final_validation_timeout_sec_ = this->get_parameter("final_validation_timeout_sec").as_double();
+    final_validation_max_retries_ = this->get_parameter("final_validation_max_retries").as_int();
+
+    if (pose_publish_hz_ <= 0.0 || final_validation_tolerance_m_ <= 0.0
+        || final_validation_timeout_sec_ <= 0.0 || final_validation_max_retries_ < 0) {
+        throw std::invalid_argument("pose/validation parameters must be positive");
+    }
 
     // Nav2 액션 클라이언트
     nav_client_ = rclcpp_action::create_client<NavigateToPose>(this, "navigate_to_pose");
@@ -119,6 +131,18 @@ AppBridgeNode::AppBridgeNode(const rclcpp::NodeOptions &options) : Node("app_bri
     pose_timer_ = this->create_wall_timer(
         period, std::bind(&AppBridgeNode::publish_robot_pose, this)
     );
+    validation_timer_ = this->create_wall_timer(
+        std::chrono::milliseconds(50), std::bind(&AppBridgeNode::check_validation_timeout, this)
+    );
+
+    lcode_pose_subscription_ = this->create_subscription<geometry_msgs::msg::PoseStamped>(
+        "/lcode/pose", rclcpp::QoS(10).reliable(),
+        std::bind(&AppBridgeNode::on_lcode_pose, this, std::placeholders::_1)
+    );
+    localization_abort_subscription_ = this->create_subscription<std_msgs::msg::Empty>(
+        "/lcode/localization_abort", rclcpp::QoS(10).reliable(),
+        std::bind(&AppBridgeNode::on_localization_abort, this, std::placeholders::_1)
+    );
 
     // TCP Acceptor 설정
     tcp::endpoint ep(tcp::v4(), static_cast<unsigned short>(port_));
@@ -131,7 +155,11 @@ AppBridgeNode::AppBridgeNode(const rclcpp::NodeOptions &options) : Node("app_bri
     // io_context를 별도 스레드에서 구동
     io_thread_ = std::thread([this]() { io_ctx_.run(); });
 
-    RCLCPP_INFO(this->get_logger(), "App Bridge started — WebSocket port %d, pose @ %.1f Hz", port_, pose_publish_hz_);
+    RCLCPP_INFO(
+        this->get_logger(),
+        "App Bridge started — WebSocket port %d, pose @ %.1f Hz, final tolerance %.3fm",
+        port_, pose_publish_hz_, final_validation_tolerance_m_
+    );
 }
 
 AppBridgeNode::~AppBridgeNode()
@@ -184,8 +212,25 @@ void AppBridgeNode::on_client_message(
             double y = msg.at("y").get<double>();
             send_nav_goal(x, y);
         } else if (type == "cancel") {
-            nav_client_->async_cancel_all_goals();
+            rclcpp_action::ClientGoalHandle<NavigateToPose>::SharedPtr goal_to_cancel;
+            {
+                std::lock_guard<std::mutex> lock(nav_state_mutex_);
+                goal_to_cancel = current_goal_handle_;
+                ++nav_generation_;
+                goal_request_pending_         = false;
+                navigation_active_            = false;
+                awaiting_final_validation_     = false;
+                localization_failure_reported_ = false;
+                current_goal_handle_.reset();
+            }
+            if (goal_to_cancel) {
+                nav_client_->async_cancel_goal(goal_to_cancel);
+            }
             RCLCPP_INFO(this->get_logger(), "Navigation cancelled by app");
+            broadcast({
+                {   "type", "nav_result" },
+                { "status",    "canceled" }
+            });
         } else {
             RCLCPP_WARN(this->get_logger(), "Unknown message type: %s", type.c_str());
         }
@@ -214,13 +259,52 @@ void AppBridgeNode::broadcast(const json &msg)
 
 void AppBridgeNode::send_nav_goal(double x, double y)
 {
+    std::uint64_t generation;
+    {
+        std::lock_guard<std::mutex> lock(nav_state_mutex_);
+        generation                           = ++nav_generation_;
+        target_x_                            = x;
+        target_y_                            = y;
+        final_validation_retries_completed_  = 0;
+        goal_request_pending_                 = false;
+        navigation_active_                   = false;
+        awaiting_final_validation_            = false;
+        localization_failure_reported_        = false;
+        current_goal_handle_.reset();
+    }
+
+    dispatch_nav_goal(generation, false);
+}
+
+void AppBridgeNode::dispatch_nav_goal(std::uint64_t generation, bool is_retry)
+{
     if (!nav_client_->wait_for_action_server(std::chrono::seconds(2))) {
         RCLCPP_ERROR(this->get_logger(), "Nav2 action server not available");
-        broadcast({
-            {   "type",         "nav_result" },
-            { "status", "server_unavailable" }
-        });
+        if (is_retry) {
+            broadcast_localization_failed(generation);
+        } else {
+            bool is_current = false;
+            {
+                std::lock_guard<std::mutex> lock(nav_state_mutex_);
+                is_current = generation == nav_generation_;
+            }
+            if (is_current) {
+                broadcast({
+                    {   "type",         "nav_result" },
+                    { "status", "server_unavailable" }
+                });
+            }
+        }
         return;
+    }
+
+    double x;
+    double y;
+    {
+        std::lock_guard<std::mutex> lock(nav_state_mutex_);
+        if (generation != nav_generation_) return;
+        x = target_x_;
+        y = target_y_;
     }
 
     // 도착 방향은 강제하지 않음 (yaw_goal_tolerance = π).
@@ -233,56 +317,241 @@ void AppBridgeNode::send_nav_goal(double x, double y)
     goal.pose.pose.orientation.w = 1.0;
 
     auto send_opts = rclcpp_action::Client<NavigateToPose>::SendGoalOptions();
+    send_opts.goal_response_callback =
+        [this, generation, is_retry](const auto &goal_handle) {
+            on_goal_response(generation, is_retry, goal_handle);
+        };
     send_opts.result_callback =
-        [this](const auto &result) { on_goal_result(result); };
+        [this, generation](const auto &result) { on_goal_result(generation, result); };
 
-    nav_client_->async_send_goal(goal, send_opts);
-    RCLCPP_INFO(this->get_logger(), "Nav goal sent: (%.2f, %.2f)", x, y);
-
-    broadcast({
-        { "type", "nav_accepted" },
-        {    "x",              x },
-        {    "y",              y }
-    });
+    {
+        std::lock_guard<std::mutex> lock(nav_state_mutex_);
+        if (generation != nav_generation_) return;
+        goal_request_pending_ = true;
+        nav_client_->async_send_goal(goal, send_opts);
+    }
+    RCLCPP_INFO(
+        this->get_logger(), "%sNav goal sent: (%.2f, %.2f)",
+        is_retry ? "Retry " : "", x, y
+    );
 }
 
 void AppBridgeNode::on_goal_response(
+    std::uint64_t generation,
+    bool is_retry,
     rclcpp_action::ClientGoalHandle<NavigateToPose>::SharedPtr goal_handle
 )
 {
+    double x = 0.0;
+    double y = 0.0;
+    bool stale_goal = false;
+    {
+        std::lock_guard<std::mutex> lock(nav_state_mutex_);
+        if (generation != nav_generation_) {
+            stale_goal = true;
+        } else {
+            goal_request_pending_ = false;
+            if (goal_handle) {
+                current_goal_handle_ = goal_handle;
+                navigation_active_   = true;
+                x                     = target_x_;
+                y                     = target_y_;
+            } else {
+                navigation_active_ = false;
+            }
+        }
+    }
+
+    if (stale_goal) {
+        if (goal_handle) {
+            nav_client_->async_cancel_goal(goal_handle);
+        }
+        return;
+    }
+
     if (!goal_handle) {
         RCLCPP_WARN(this->get_logger(), "Goal rejected by Nav2");
+        if (is_retry) {
+            broadcast_localization_failed(generation);
+        } else {
+            broadcast({
+                {   "type", "nav_result" },
+                { "status",   "rejected" }
+            });
+        }
+        return;
+    }
+
+    if (!is_retry) {
         broadcast({
-            {   "type", "nav_result" },
-            { "status",   "rejected" }
+            { "type", "nav_accepted" },
+            {    "x",              x },
+            {    "y",              y }
         });
     }
 }
 
 void AppBridgeNode::on_goal_result(
+    std::uint64_t generation,
     const rclcpp_action::ClientGoalHandle<NavigateToPose>::WrappedResult &result
 )
 {
-    std::string status;
-    switch (result.code) {
-    case rclcpp_action::ResultCode::SUCCEEDED:
-        status = "succeeded";
-        break;
-    case rclcpp_action::ResultCode::ABORTED:
-        status = "aborted";
-        break;
-    case rclcpp_action::ResultCode::CANCELED:
-        status = "canceled";
-        break;
-    default:
-        status = "unknown";
-        break;
+    {
+        std::lock_guard<std::mutex> lock(nav_state_mutex_);
+        if (generation != nav_generation_) return;
+
+        goal_request_pending_ = false;
+        navigation_active_ = false;
+        current_goal_handle_.reset();
+        if (result.code == rclcpp_action::ResultCode::SUCCEEDED) {
+            validation_started_sec_      = this->get_clock()->now().seconds();
+            validation_deadline_sec_     = validation_started_sec_ + final_validation_timeout_sec_;
+            awaiting_final_validation_   = true;
+        }
     }
+
+    if (result.code == rclcpp_action::ResultCode::SUCCEEDED) {
+        RCLCPP_INFO(
+            this->get_logger(),
+            "Nav2 goal reached — waiting %.2fs for a fresh L-code pose",
+            final_validation_timeout_sec_
+        );
+        return;
+    }
+
+    std::string status = "unknown";
+    if (result.code == rclcpp_action::ResultCode::ABORTED) status = "aborted";
+    else if (result.code == rclcpp_action::ResultCode::CANCELED) status = "canceled";
 
     RCLCPP_INFO(this->get_logger(), "Navigation result: %s", status.c_str());
     broadcast({
         {   "type", "nav_result" },
         { "status",       status }
+    });
+}
+
+void AppBridgeNode::on_lcode_pose(const geometry_msgs::msg::PoseStamped::SharedPtr msg)
+{
+    if (msg->header.frame_id != "map") return;
+
+    const double pose_stamp = rclcpp::Time(msg->header.stamp).seconds();
+    std::uint64_t generation;
+    double target_x;
+    double target_y;
+    int retries_completed;
+    GoalValidation::Decision decision;
+    double error_m;
+
+    {
+        std::lock_guard<std::mutex> lock(nav_state_mutex_);
+        if (!awaiting_final_validation_ || pose_stamp < validation_started_sec_) return;
+
+        generation        = nav_generation_;
+        target_x          = target_x_;
+        target_y          = target_y_;
+        retries_completed = final_validation_retries_completed_;
+        error_m            = GoalValidation::distance(
+            target_x, target_y, msg->pose.position.x, msg->pose.position.y
+        );
+        decision = GoalValidation::evaluate(
+            target_x, target_y, msg->pose.position.x, msg->pose.position.y,
+            final_validation_tolerance_m_, retries_completed, final_validation_max_retries_
+        );
+
+        awaiting_final_validation_ = false;
+        if (decision == GoalValidation::Decision::RETRY) {
+            ++final_validation_retries_completed_;
+        }
+    }
+
+    if (decision == GoalValidation::Decision::SUCCEEDED) {
+        RCLCPP_INFO(this->get_logger(), "Final L-code validation succeeded (error %.3fm)", error_m);
+        broadcast({
+            {   "type", "nav_result" },
+            { "status",  "succeeded" }
+        });
+    } else if (decision == GoalValidation::Decision::RETRY) {
+        RCLCPP_WARN(
+            this->get_logger(),
+            "Final position error %.3fm — retrying goal (%d/%d)",
+            error_m, retries_completed + 1, final_validation_max_retries_
+        );
+        dispatch_nav_goal(generation, true);
+    } else {
+        RCLCPP_ERROR(
+            this->get_logger(),
+            "Final position error %.3fm after %d retries",
+            error_m, retries_completed
+        );
+        broadcast_localization_failed(generation);
+    }
+}
+
+void AppBridgeNode::on_localization_abort(const std_msgs::msg::Empty::SharedPtr /*msg*/)
+{
+    bool should_report = false;
+    rclcpp_action::ClientGoalHandle<NavigateToPose>::SharedPtr goal_to_cancel;
+    {
+        std::lock_guard<std::mutex> lock(nav_state_mutex_);
+        if ((goal_request_pending_ || navigation_active_ || awaiting_final_validation_)
+            && !localization_failure_reported_) {
+            goal_to_cancel                    = current_goal_handle_;
+            localization_failure_reported_    = true;
+            goal_request_pending_              = false;
+            navigation_active_                = false;
+            awaiting_final_validation_         = false;
+            current_goal_handle_.reset();
+            ++nav_generation_; // 내부 cancel 결과와 이전 action 콜백 무효화
+            should_report = true;
+        }
+    }
+    if (!should_report) return;
+
+    if (goal_to_cancel) {
+        nav_client_->async_cancel_goal(goal_to_cancel);
+    }
+    RCLCPP_ERROR(this->get_logger(), "L-code localization failed — current Nav2 goal cancelled");
+    broadcast({
+        {   "type",           "nav_result" },
+        { "status", "localization_failed" }
+    });
+}
+
+void AppBridgeNode::check_validation_timeout()
+{
+    std::uint64_t generation = 0;
+    bool timed_out = false;
+    {
+        std::lock_guard<std::mutex> lock(nav_state_mutex_);
+        const double now = this->get_clock()->now().seconds();
+        if (awaiting_final_validation_ && now >= validation_deadline_sec_) {
+            generation                    = nav_generation_;
+            awaiting_final_validation_    = false;
+            timed_out                     = true;
+        }
+    }
+    if (!timed_out) return;
+
+    RCLCPP_ERROR(
+        this->get_logger(), "No fresh L-code pose received within %.2fs", final_validation_timeout_sec_
+    );
+    broadcast_localization_failed(generation);
+}
+
+void AppBridgeNode::broadcast_localization_failed(std::uint64_t generation)
+{
+    {
+        std::lock_guard<std::mutex> lock(nav_state_mutex_);
+        if (generation != nav_generation_ || localization_failure_reported_) return;
+        localization_failure_reported_ = true;
+        goal_request_pending_          = false;
+        navigation_active_             = false;
+        awaiting_final_validation_      = false;
+        current_goal_handle_.reset();
+    }
+    broadcast({
+        {   "type",           "nav_result" },
+        { "status", "localization_failed" }
     });
 }
 

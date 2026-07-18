@@ -34,6 +34,15 @@ DriverNode::DriverNode() : Node("driver_node"), x_(0.0), y_(0.0), th_(0.0), vx_(
     this->declare_parameter<double>("rotation_speed_threshold", 0.05); // |wz| (rad/s)
     this->declare_parameter<double>("linear_speed_threshold", 0.02);   // |vx|/|vy| (m/s)
 
+    // 주기적 L-code 보정 파라미터. 기본은 비활성화하고 실물 launch에서 켠다.
+    this->declare_parameter<bool>("periodic_localization_enabled", false);
+    this->declare_parameter<double>("localization_distance_interval_m", 0.20);
+    this->declare_parameter<double>("localization_angle_interval_rad", 0.523599);
+    this->declare_parameter<double>("localization_settle_sec", 0.30);
+    this->declare_parameter<double>("localization_wait_timeout_sec", 2.0);
+    this->declare_parameter<double>("post_correction_hold_sec", 0.15);
+    this->declare_parameter<double>("fault_rearm_zero_sec", 0.50);
+
     // 초기값 적용
     robot_->K_                      = this->get_parameter("wheel_rotation_k").as_double();
     robot_->speed_scale_            = this->get_parameter("speed_scale").as_double();
@@ -47,13 +56,61 @@ DriverNode::DriverNode() : Node("driver_node"), x_(0.0), y_(0.0), th_(0.0), vx_(
     settle_duration_                = this->get_parameter("settle_after_rotation").as_double();
     rotation_speed_threshold_       = this->get_parameter("rotation_speed_threshold").as_double();
     linear_speed_threshold_         = this->get_parameter("linear_speed_threshold").as_double();
-    RCLCPP_INFO(this->get_logger(), "Motor params: K=%.3f, speed_scale=%.1f, min_pwm=%d, deadzone=%d, max_pwm=%d, cmd_timeout=%.2fs, settle=%.2fs", robot_->K_, robot_->speed_scale_, robot_->min_pwm_, robot_->pwm_deadzone_, robot_->max_pwm_, cmd_timeout_, settle_duration_);
+    periodic_localization_enabled_  = this->get_parameter("periodic_localization_enabled").as_bool();
+    localization_distance_interval_m_ = this->get_parameter("localization_distance_interval_m").as_double();
+    localization_angle_interval_rad_ = this->get_parameter("localization_angle_interval_rad").as_double();
+    localization_settle_sec_ = this->get_parameter("localization_settle_sec").as_double();
+    localization_wait_timeout_sec_ = this->get_parameter("localization_wait_timeout_sec").as_double();
+    post_correction_hold_sec_ = this->get_parameter("post_correction_hold_sec").as_double();
+    fault_rearm_zero_sec_ = this->get_parameter("fault_rearm_zero_sec").as_double();
+    update_pause_config();
+
+    RCLCPP_INFO(
+        this->get_logger(),
+        "Motor params: K=%.3f, speed_scale=%.1f, min_pwm=%d, deadzone=%d, "
+        "max_pwm=%d, cmd_timeout=%.2fs, rotation_settle=%.2fs",
+        robot_->K_, robot_->speed_scale_, robot_->min_pwm_, robot_->pwm_deadzone_,
+        robot_->max_pwm_, cmd_timeout_, settle_duration_
+    );
+    RCLCPP_INFO(
+        this->get_logger(),
+        "Periodic localization: %s, distance=%.3fm, angle=%.3frad, settle=%.2fs, timeout=%.2fs",
+        periodic_localization_enabled_ ? "enabled" : "disabled",
+        localization_distance_interval_m_, localization_angle_interval_rad_,
+        localization_settle_sec_, localization_wait_timeout_sec_
+    );
 
     // 런타임 변경 (`ros2 param set /driver_node min_pwm 90` 등) 즉시 반영
     param_cb_handle_ = this->add_on_set_parameters_callback(
         [this](const std::vector<rclcpp::Parameter> &params) {
             rcl_interfaces::msg::SetParametersResult res;
             res.successful = true;
+
+            bool periodic_enabled = periodic_localization_enabled_;
+            double distance_interval = localization_distance_interval_m_;
+            double angle_interval = localization_angle_interval_rad_;
+            double settle_sec = localization_settle_sec_;
+            double wait_timeout_sec = localization_wait_timeout_sec_;
+            double correction_hold_sec = post_correction_hold_sec_;
+            double rearm_zero_sec = fault_rearm_zero_sec_;
+
+            for (const auto &p : params) {
+                if (p.get_name() == "periodic_localization_enabled") periodic_enabled = p.as_bool();
+                else if (p.get_name() == "localization_distance_interval_m") distance_interval = p.as_double();
+                else if (p.get_name() == "localization_angle_interval_rad") angle_interval = p.as_double();
+                else if (p.get_name() == "localization_settle_sec") settle_sec = p.as_double();
+                else if (p.get_name() == "localization_wait_timeout_sec") wait_timeout_sec = p.as_double();
+                else if (p.get_name() == "post_correction_hold_sec") correction_hold_sec = p.as_double();
+                else if (p.get_name() == "fault_rearm_zero_sec") rearm_zero_sec = p.as_double();
+            }
+            if (distance_interval <= 0.0 || angle_interval <= 0.0 || settle_sec < 0.0
+                || wait_timeout_sec <= 0.0 || correction_hold_sec < 0.0
+                || rearm_zero_sec < 0.0) {
+                res.successful = false;
+                res.reason = "localization intervals/timeouts must be positive";
+                return res;
+            }
+
             for (const auto &p : params) {
                 if (p.get_name() == "wheel_rotation_k") robot_->K_ = p.as_double();
                 else if (p.get_name() == "speed_scale") robot_->speed_scale_ = p.as_double();
@@ -68,7 +125,20 @@ DriverNode::DriverNode() : Node("driver_node"), x_(0.0), y_(0.0), th_(0.0), vx_(
                 else if (p.get_name() == "rotation_speed_threshold") rotation_speed_threshold_ = p.as_double();
                 else if (p.get_name() == "linear_speed_threshold") linear_speed_threshold_ = p.as_double();
             }
-            RCLCPP_INFO(this->get_logger(), "Motor params updated: K=%.3f, speed_scale=%.1f, min_pwm=%d, deadzone=%d, max_pwm=%d, cmd_timeout=%.2fs, settle=%.2fs", robot_->K_, robot_->speed_scale_, robot_->min_pwm_, robot_->pwm_deadzone_, robot_->max_pwm_, cmd_timeout_, settle_duration_);
+            periodic_localization_enabled_ = periodic_enabled;
+            localization_distance_interval_m_ = distance_interval;
+            localization_angle_interval_rad_ = angle_interval;
+            localization_settle_sec_ = settle_sec;
+            localization_wait_timeout_sec_ = wait_timeout_sec;
+            post_correction_hold_sec_ = correction_hold_sec;
+            fault_rearm_zero_sec_ = rearm_zero_sec;
+            update_pause_config();
+            RCLCPP_INFO(
+                this->get_logger(),
+                "Parameters updated: periodic_localization=%s, distance=%.3fm, angle=%.3frad",
+                periodic_localization_enabled_ ? "enabled" : "disabled",
+                localization_distance_interval_m_, localization_angle_interval_rad_
+            );
             return res;
         }
     );
@@ -79,6 +149,13 @@ DriverNode::DriverNode() : Node("driver_node"), x_(0.0), y_(0.0), th_(0.0), vx_(
 
     subscription_ = this->create_subscription<geometry_msgs::msg::Twist>(
         "/cmd_vel", 10, std::bind(&DriverNode::cmd_vel_callback, this, std::placeholders::_1)
+    );
+    lcode_pose_subscription_ = this->create_subscription<geometry_msgs::msg::PoseStamped>(
+        "/lcode/pose", rclcpp::QoS(10).reliable(),
+        std::bind(&DriverNode::lcode_pose_callback, this, std::placeholders::_1)
+    );
+    localization_abort_publisher_ = this->create_publisher<std_msgs::msg::Empty>(
+        "/lcode/localization_abort", rclcpp::QoS(10).reliable()
     );
 
     // 오도메트리 업데이트 타이머 (50Hz)
@@ -114,6 +191,40 @@ bool DriverNode::is_linear_cmd(const geometry_msgs::msg::Twist &t) const
            && std::abs(t.angular.z) < rotation_speed_threshold_;
 }
 
+bool DriverNode::is_zero_cmd(const geometry_msgs::msg::Twist &t) const
+{
+    return std::abs(t.linear.x) < linear_speed_threshold_
+           && std::abs(t.linear.y) < linear_speed_threshold_
+           && std::abs(t.angular.z) < rotation_speed_threshold_;
+}
+
+void DriverNode::update_pause_config()
+{
+    LocalizationPauseController::Config config;
+    config.enabled                     = periodic_localization_enabled_;
+    config.distance_interval_m         = localization_distance_interval_m_;
+    config.angle_interval_rad          = localization_angle_interval_rad_;
+    config.settle_sec                  = localization_settle_sec_;
+    config.wait_timeout_sec            = localization_wait_timeout_sec_;
+    config.post_correction_hold_sec    = post_correction_hold_sec_;
+    config.fault_rearm_zero_sec        = fault_rearm_zero_sec_;
+    pause_controller_.set_config(config);
+}
+
+void DriverNode::stop_for_localization(const char *reason, double settle_override_sec)
+{
+    auto now = this->get_clock()->now();
+    pause_controller_.start_pause(now.seconds(), settle_override_sec);
+    robot_->stop();
+    vx_ = vy_ = wz_ = 0.0;
+    last_was_rotation_ = false;
+    RCLCPP_INFO(
+        this->get_logger(),
+        "L-code 보정 정지 시작 (%s, distance=%.3fm, angle=%.3frad)",
+        reason, pause_controller_.accumulated_distance(), pause_controller_.accumulated_angle()
+    );
+}
+
 void DriverNode::apply_cmd(const geometry_msgs::msg::Twist &t)
 {
     vx_ = t.linear.x;
@@ -133,30 +244,16 @@ void DriverNode::cmd_vel_callback(const geometry_msgs::msg::Twist::SharedPtr msg
     last_command_time_ = now;
     timed_out_         = false; // 새 명령 도착 — 타임아웃 상태 해제
 
-    // settle 모드 진행 중인 경우: 명령은 보존만 하고 모터에는 보내지 않는다.
-    // 단, 새 명령이 다시 회전이면 settle 의미가 없으므로 즉시 종료하고 발행.
-    if (settling_) {
-        if (is_rotation_cmd(*msg)) {
-            settling_ = false;
-            RCLCPP_INFO(this->get_logger(), "settle 중 회전 재요청 — 즉시 재개");
-            apply_cmd(*msg);
-        } else {
-            pending_cmd_ = *msg; // 최신 명령만 유지
-        }
+    // 보정 중에는 Nav2 명령을 폐기한다. 보정 후 hold가 끝난 뒤 도착한 새 명령만 통과한다.
+    if (!pause_controller_.should_forward_command(is_zero_cmd(*msg), now.seconds())) {
+        robot_->stop();
+        vx_ = vy_ = wz_ = 0.0;
         return;
     }
 
-    // 회전 → 선형 이동 전환 감지: settle 진입
+    // 기존 회전→직진 settle도 동일한 L-code 보정 상태 머신으로 처리한다.
     if (settle_duration_ > 0.0 && last_was_rotation_ && is_linear_cmd(*msg)) {
-        settling_          = true;
-        settle_start_time_ = now;
-        pending_cmd_       = *msg;
-        robot_->stop();
-        vx_ = vy_ = wz_ = 0.0;
-        last_was_rotation_ = false; // settle 중에는 회전 상태가 아님
-        RCLCPP_INFO(this->get_logger(),
-                    "회전→직진 전환 감지 — %.2fs settle 시작 (map→odom 보정 대기)",
-                    settle_duration_);
+        stop_for_localization("rotation-to-linear", settle_duration_);
         return;
     }
 
@@ -185,6 +282,12 @@ void DriverNode::update_odometry()
     x_ += delta_x;
     y_ += delta_y;
     th_ += delta_th;
+
+    if (pause_controller_.update_motion(
+            eff_vx, eff_vy, eff_wz, dt, now.seconds()
+        )) {
+        stop_for_localization("periodic-threshold");
+    }
 
     // 2. TF 발행 (odom -> base_link)
     geometry_msgs::msg::TransformStamped t;
@@ -237,19 +340,27 @@ void DriverNode::check_timeout()
 {
     auto now = this->get_clock()->now();
 
-    // settle 처리 우선: 시간이 다 되면 그동안 수집한 최신 명령을 적용한다.
-    if (settling_) {
-        if ((now - settle_start_time_).seconds() >= settle_duration_) {
-            settling_ = false;
-            RCLCPP_INFO(this->get_logger(),
-                        "settle 종료 — pending cmd 발행 (vx=%.2f, vy=%.2f, wz=%.2f)",
-                        pending_cmd_.linear.x, pending_cmd_.linear.y, pending_cmd_.angular.z);
-            apply_cmd(pending_cmd_);
-            last_command_time_ = now; // settle 직후 cmd_timeout으로 또 stop 들어가는 일 방지
-        } else {
-            last_command_time_ = now; // settle 중엔 timeout 카운트도 멈춰둠
-        }
-        return; // settle 중/직후엔 아래 timeout 로직 건너뜀
+    auto event = pause_controller_.on_timer(now.seconds());
+    if (event == LocalizationPauseController::TimerEvent::WAITING_STARTED) {
+        RCLCPP_INFO(this->get_logger(), "정지 안정화 완료 — 새 L-code 인식 대기");
+    } else if (event == LocalizationPauseController::TimerEvent::LOCALIZATION_ABORT) {
+        robot_->stop();
+        vx_ = vy_ = wz_ = 0.0;
+        localization_abort_publisher_->publish(std_msgs::msg::Empty());
+        RCLCPP_ERROR(
+            this->get_logger(),
+            "L-code 인식이 %.2fs 안에 성공하지 못해 내비게이션 중단 요청",
+            localization_wait_timeout_sec_
+        );
+    } else if (event == LocalizationPauseController::TimerEvent::FAULT_REARMED) {
+        last_command_time_ = now;
+        timed_out_ = false;
+        RCLCPP_INFO(this->get_logger(), "L-code fault 재무장 완료 — 새 목표 수신 가능");
+    }
+
+    if (pause_controller_.state() != LocalizationPauseController::State::PASS_THROUGH) {
+        last_command_time_ = now;
+        return;
     }
 
     if (timed_out_) return; // 이미 정지 상태면 I²C로 stop 중복 전송 안 함
@@ -261,5 +372,33 @@ void DriverNode::check_timeout()
         timed_out_         = true;
         last_was_rotation_ = false; // 정지 상태에선 회전 이력도 리셋
         RCLCPP_WARN(this->get_logger(), "cmd_vel 미수신 %.2fs 초과 — 모터 정지", cmd_timeout_);
+    }
+}
+
+void DriverNode::lcode_pose_callback(const geometry_msgs::msg::PoseStamped::SharedPtr msg)
+{
+    if (msg->header.frame_id != "map") {
+        RCLCPP_WARN_THROTTLE(
+            this->get_logger(), *this->get_clock(), 2000,
+            "map 프레임이 아닌 L-code pose 무시: %s", msg->header.frame_id.c_str()
+        );
+        return;
+    }
+
+    const auto event = pause_controller_.on_pose(
+        rclcpp::Time(msg->header.stamp).seconds(), this->get_clock()->now().seconds()
+    );
+    if (event == LocalizationPauseController::PoseEvent::PAUSE_CORRECTION) {
+        const double recognition_sec = this->get_clock()->now().seconds()
+                                       - pause_controller_.waiting_since();
+        robot_->stop();
+        vx_ = vy_ = wz_ = 0.0;
+        RCLCPP_INFO(
+            this->get_logger(),
+            "새 L-code 보정 수신 (인식 대기 %.3fs) — %.2fs 후 새 cmd_vel부터 주행 재개",
+            recognition_sec, post_correction_hold_sec_
+        );
+    } else if (event == LocalizationPauseController::PoseEvent::RUNNING_CORRECTION) {
+        RCLCPP_DEBUG(this->get_logger(), "주행 중 L-code 보정 성공 — 누적 이동량 초기화");
     }
 }

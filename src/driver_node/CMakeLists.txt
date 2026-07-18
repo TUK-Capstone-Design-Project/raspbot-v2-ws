@@ -22,9 +22,9 @@ find_package(tf2_ros REQUIRED)
 
 # 2. 실행 파일 생성
 # [중요] src/main.cpp를 추가하여 'undefined reference to main' 에러를 해결합니다.
-add_executable(driver_node 
+add_executable(driver_node
   src/main.cpp
-  src/DriverNode.cpp 
+  src/DriverNode.cpp
   src/KinematicsInterface.cpp
 )
 
@@ -63,9 +63,17 @@ install(DIRECTORY include/
 # 7. 테스트 및 린트 설정
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
+  find_package(ament_cmake_gtest REQUIRED)
   set(ament_cmake_copyright_FOUND TRUE)
   set(ament_cmake_cpplint_FOUND TRUE)
   ament_lint_auto_find_test_dependencies()
+
+  ament_add_gtest(localization_pause_controller_test
+    test/localization_pause_controller_test.cpp
+  )
+  target_include_directories(localization_pause_controller_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+  )
 endif()
 
 # 8. 패키지 구성 완료

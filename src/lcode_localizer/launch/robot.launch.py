@@ -5,12 +5,13 @@ from launch.actions import IncludeLaunchDescription
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch_ros.actions import Node
 
+
 def generate_launch_description():
     # 1. 경로 설정
     pkg_localizer = get_package_share_directory('lcode_localizer')
     pkg_description = get_package_share_directory('yahboomcar_description')
     pkg_nav2 = get_package_share_directory('nav2_bringup')
-    
+
     # 파일 경로
     nav2_params = os.path.join(pkg_localizer, 'params', 'nav2_params.yaml')
     map_yaml = os.path.join(pkg_localizer, 'params', 'lcode_map.yaml')
@@ -27,14 +28,14 @@ def generate_launch_description():
         name='robot_state_publisher',
         output='screen',
         parameters=[{
-            'use_sim_time': False, 
+            'use_sim_time': False,
             'robot_description': robot_description_content,
             'publish_frequency': 50.0,
             'frame_prefix': ''
         }]
     )
 
-    # 3. [추가] 실제 카메라 노드 
+    # 3. [추가] 실제 카메라 노드
     camera_node2 = Node(
         package='camera_node2',
         executable='camera_node2',
@@ -50,7 +51,16 @@ def generate_launch_description():
         executable='driver_node',
         name='driver_node',
         output='screen',
-        parameters=[{'use_sim_time': False}]
+        parameters=[{
+            'use_sim_time': False,
+            'periodic_localization_enabled': True,
+            'localization_distance_interval_m': 0.40,
+            'localization_angle_interval_rad': 0.785398,
+            'localization_settle_sec': 0.30,
+            'localization_wait_timeout_sec': 2.0,
+            'post_correction_hold_sec': 0.15,
+            'fault_rearm_zero_sec': 0.50,
+        }]
     )
 
     # 5. L-Code Localizer (use_sim_time: False)
@@ -59,7 +69,10 @@ def generate_launch_description():
         executable='lcode_localizer_node',
         name='lcode_localizer',
         output='screen',
-        parameters=[{'use_sim_time': False}]
+        parameters=[{
+            'use_sim_time': False,
+            'save_debug_images': False,
+        }]
     )
 
     # 6. Nav2 Navigation only (amcl 제외)
@@ -115,6 +128,9 @@ def generate_launch_description():
             'use_sim_time': False,
             'port': 5000,
             'pose_publish_hz': 2.0,
+            'final_validation_tolerance_m': 0.03,
+            'final_validation_timeout_sec': 2.0,
+            'final_validation_max_retries': 2,
         }]
     )
 

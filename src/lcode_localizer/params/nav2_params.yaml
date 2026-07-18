@@ -38,10 +38,13 @@ controller_server:
 
     FollowPath:
       plugin: "nav2_rotation_shim_controller::RotationShimController"
-      angular_dist_threshold: 0.30        # 0.15→0.30(~17도): 임계각 늘려 rotation_shim 발동 빈도 ↓ (꼬불꼬불 방지)
-      forward_sampling_distance: 0.5
-      rotate_to_heading_angular_vel: 0.5  # 제자리 회전 속도
+      angular_dist_threshold: 1.55        # 초기 경로가 약 90도 이상 뒤쪽일 때만 제자리 회전 진입
+      angular_disengage_threshold: 0.15   # 진입 후 약 8.6도 이내로 정렬될 때까지 제자리 회전 유지
+      forward_sampling_distance: 0.02     # xy goal tolerance보다 먼 짧은 경로에서도 shim 적용
+      # rotate_to_heading_angular_vel: 0.5  # 제자리 회전 속도
       max_angular_accel: 0.5              # 각가속도 제한 (부드러운 회전)
+      rotate_to_heading_angular_vel: 1.3
+      max_angular_accel: 2.5
       simulate_ahead_time: 1.0
       primary_controller: "nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController"
       desired_linear_vel: 0.3
@@ -59,8 +62,9 @@ controller_server:
       allow_reversing: false
       max_robot_pose_search_dist: 10.0
       transform_tolerance: 0.5
-      rotate_to_heading_min_angle: 0.15
-      use_rotate_to_heading: false
+      # rotate_to_heading_min_angle: 0.15
+      rotate_to_heading_min_angle: 0.5 # next
+      use_rotate_to_heading: true
 
 planner_server:
   ros__parameters:

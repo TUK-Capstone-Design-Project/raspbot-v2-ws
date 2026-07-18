@@ -15,6 +15,7 @@ find_package(rclcpp REQUIRED)
 find_package(rclcpp_action REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(nav2_msgs REQUIRED)
+find_package(std_msgs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(Boost REQUIRED COMPONENTS system)
@@ -42,6 +43,7 @@ ament_target_dependencies(app_bridge_node
   rclcpp_action
   geometry_msgs
   nav2_msgs
+  std_msgs
   tf2
   tf2_ros
 )
@@ -51,10 +53,18 @@ install(TARGETS app_bridge_node
 )
 
 if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
   find_package(ament_lint_auto REQUIRED)
   set(ament_cmake_copyright_FOUND TRUE)
   set(ament_cmake_cpplint_FOUND TRUE)
   ament_lint_auto_find_test_dependencies()
+
+  ament_add_gtest(goal_validation_test
+    test/goal_validation_test.cpp
+  )
+  target_include_directories(goal_validation_test PRIVATE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  )
 endif()
 
 ament_package()

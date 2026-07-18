@@ -1,6 +1,7 @@
 #include <cmath>
 #include <cv_bridge/cv_bridge.h>
 #include <filesystem>
+#include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <opencv2/core.hpp>
@@ -21,18 +22,18 @@
 #include "Digitizer/Digitizer.hpp"
 #include "ImgPreprocessor/ImgPreprocessor.hpp"
 
-#define DECODER_DEBUG_MODE // 디버그 모드 비활성화
-
 class LCodeLocalizerNode : public rclcpp::Node
 {
 public:
     LCodeLocalizerNode() : Node("lcode_localizer_node")
     {
-        #ifdef DECODER_DEBUG_MODE
-        std::filesystem::create_directories("./resize_images"); // 디버깅용 디렉토리 생성
-        std::filesystem::create_directories("./resize_images/success"); // 디버깅용 디렉토리 생성
-        std::filesystem::create_directories("./resize_images/failed"); // 디버깅용 디렉토리 생성
-        #endif
+        this->declare_parameter<bool>("save_debug_images", false);
+        save_debug_images_ = this->get_parameter("save_debug_images").as_bool();
+        if (save_debug_images_) {
+            std::filesystem::create_directories("./resize_images/success");
+            std::filesystem::create_directories("./resize_images/failed");
+        }
+
         config_    = std::make_shared<LCODE::ConfigSettings>();
         ba_        = std::make_unique<LCODE::BGArray>(*config_);
         digitizer_ = std::make_unique<LCODE::Digitizer>(*config_);
@@ -42,6 +43,9 @@ public:
         tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
 
         tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
+        pose_pub_ = this->create_publisher<geometry_msgs::msg::PoseStamped>(
+            "/lcode/pose", rclcpp::QoS(10).reliable()
+        );
         // odom_pub_ = this->create_publisher<nav_msgs::msg::Odometry>("/odom", 10);
 
         // 캐시 초기값: identity (map == odom). 첫 L-Code 인식 전까지는 이 값이 발행되어
@@ -89,9 +93,12 @@ private:
 
     rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr img_sub_;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr    odom_pub_;
+    rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pose_pub_;
     std::unique_ptr<tf2_ros::TransformBroadcaster>           tf_broadcaster_;
 
     double last_x = 0.0, last_y = 0.0, last_th = 0.0;
+    bool   save_debug_images_{ false };
+    int    failed_image_count_{ 0 };
 
     // 마지막으로 계산한 map→odom. 새 L-Code 인식이 들어와 publish_all() 이 호출될 때만 갱신되고,
     // 타이머는 stamp 만 갈아끼워서 이걸 그대로 재발행한다. 그 결과 인식 사이엔 map→odom 이
@@ -115,23 +122,16 @@ private:
 
         cv::resize(src, src, {}, 0.5, 0.5);                  // 1280x720 -> 640x360 (처리 속도 개선)
         cv::rotate(src, src, cv::ROTATE_90_CLOCKWISE);
-        static int success_count = 0;
-        static int failed_count = 0;
         // 1, 이미지 전처리
         if (!preprocessor_->run(src)) {
-        #ifdef DECODER_DEBUG_MODE
-
-            cv::imwrite("./resize_images/failed/" + std::to_string(failed_count++) + ".jpg", src); // 디버깅용 실패 이미지 저장
-        #endif
+            save_failed_image(src);
             RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "L-Code 해독 실패: preprocessor 처리 실패 (마커 미발견 등)");
             return;
         }
 
         // 2. 디지타이징
         if (!digitizer_->runDigitize(*preprocessor_)) {
-        #ifdef DECODER_DEBUG_MODE
-            cv::imwrite("./resize_images/failed/" + std::to_string(failed_count++) + ".jpg", src); // 디버깅용 실패 이미지 저장
-        #endif
+            save_failed_image(src);
             RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "L-Code 해독 실패: digitizer 처리 실패");
             return;
         }
@@ -140,15 +140,10 @@ private:
         double raw_angle    = preprocessor_->camera_up_angle_;
         auto [raw_x, raw_y] = ba_->getPos(digitizer_->digitizied_array, digitizer_->movementIndex);
         if (raw_x == -1 || raw_y == -1) {
-        #ifdef DECODER_DEBUG_MODE
-            cv::imwrite("./resize_images/failed/" + std::to_string(failed_count++) + ".jpg", src); // 디버깅용 실패 이미지 저장
-        #endif
+            save_failed_image(src);
             RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "L-Code 해독 실패: 유효한 좌표를 얻지 못함");
             return;
         }
-        #ifdef DECODER_DEBUG_MODE
-        // cv::imwrite("./resize_images/success/" + std::to_string(success_count++) + ".jpg", src); // 디버깅용 성공 이미지 저장
-        #endif
         
         // 4. 방향(Heading) 계산 (L-Code에서 준 angle 반영);
         //
@@ -189,12 +184,33 @@ private:
 
         // 5. 새 인식 결과를 바탕으로 map→odom 을 (재)계산하고 캐시에 박는다.
         //    이후엔 타이머가 같은 transform 을 stamp 만 갱신하며 재발행한다.
-        update_map_to_odom(last_x, last_y, last_th, this->get_clock()->now());
+        geometry_msgs::msg::PoseStamped corrected_pose;
+        if (update_map_to_odom(
+                last_x, last_y, last_th, stamp, corrected_pose
+            )) {
+            corrected_pose.header.stamp = msg->header.stamp;
+            pose_pub_->publish(corrected_pose);
+        }
+    }
+
+    void save_failed_image(const cv::Mat &image)
+    {
+        if (!save_debug_images_) return;
+        cv::imwrite(
+            "./resize_images/failed/" + std::to_string(failed_image_count_++) + ".jpg",
+            image
+        );
     }
 
     // 한 번의 L-Code 인식 결과로 map→odom 보정값을 새로 계산해 캐시에 저장하고 즉시 1회 발행한다.
     // 이전 구현(publish_all) 과 달리 타이머에서는 호출되지 않는다.
-    void update_map_to_odom(double map_x, double map_y, double map_th, const rclcpp::Time &stamp)
+    bool update_map_to_odom(
+        double map_x,
+        double map_y,
+        double map_th,
+        const rclcpp::Time &stamp,
+        geometry_msgs::msg::PoseStamped &corrected_pose
+    )
     {
         // --- 카메라 → base_link 오프셋 (URDF에서 확인 후 값 입력) ---
         // 카메라가 base_link 기준으로 (cam_offset_x, cam_offset_y) 만큼 떨어져 있음
@@ -215,15 +231,15 @@ private:
         // --- 이하 base_x, base_y, base_th를 사용 ---
         geometry_msgs::msg::TransformStamped odom_to_base;
         try {
-            if (!tf_buffer_->canTransform("odom", "base_link", tf2::TimePointZero)) {
-                return; // 아직 트리가 없으면 종료
+            if (!tf_buffer_->canTransform("odom", "base_link", stamp)) {
+                return false; // 아직 트리가 없으면 종료
             }
             odom_to_base = tf_buffer_->lookupTransform(
-                "odom", "base_link", tf2::TimePointZero
+                "odom", "base_link", stamp
             );
         } catch (const tf2::TransformException &ex) {
             RCLCPP_DEBUG(this->get_logger(), "odom->base_link TF 조회 보류 중: %s", ex.what());
-            return;
+            return false;
         }
 
         double odom_x = odom_to_base.transform.translation.x;
@@ -247,8 +263,17 @@ private:
         tf2::Quaternion q;
         q.setRPY(0.0, 0.0, delta_th);
 
+        const double previous_corr_x = cached_map_to_odom_.transform.translation.x;
+        const double previous_corr_y = cached_map_to_odom_.transform.translation.y;
+        const double previous_corr_th = tf2::getYaw(tf2::Quaternion(
+            cached_map_to_odom_.transform.rotation.x,
+            cached_map_to_odom_.transform.rotation.y,
+            cached_map_to_odom_.transform.rotation.z,
+            cached_map_to_odom_.transform.rotation.w
+        ));
+
         // 캐시에 기록 (frame_id/child_frame_id 는 생성자에서 이미 설정됨)
-        cached_map_to_odom_.header.stamp            = stamp;
+        cached_map_to_odom_.header.stamp            = this->get_clock()->now();
         cached_map_to_odom_.transform.translation.x = corr_x;
         cached_map_to_odom_.transform.translation.y = corr_y;
         cached_map_to_odom_.transform.translation.z = 0.0;
@@ -257,8 +282,33 @@ private:
         cached_map_to_odom_.transform.rotation.z    = q.z();
         cached_map_to_odom_.transform.rotation.w    = q.w();
 
+        const double correction_distance = std::hypot(
+            corr_x - previous_corr_x, corr_y - previous_corr_y
+        );
+        const double correction_angle = std::atan2(
+            std::sin(delta_th - previous_corr_th),
+            std::cos(delta_th - previous_corr_th)
+        );
+        RCLCPP_INFO(
+            this->get_logger(),
+            "map->odom 보정 변화: translation=%.3fm, rotation=%.3frad",
+            correction_distance, correction_angle
+        );
+
         // 즉시 1회 발행 (타이머 주기를 기다리지 않고 빠르게 반영).
         tf_broadcaster_->sendTransform(cached_map_to_odom_);
+
+        corrected_pose.header.frame_id = "map";
+        corrected_pose.pose.position.x = base_x;
+        corrected_pose.pose.position.y = base_y;
+        corrected_pose.pose.position.z = 0.0;
+        tf2::Quaternion base_q;
+        base_q.setRPY(0.0, 0.0, base_th);
+        corrected_pose.pose.orientation.x = base_q.x();
+        corrected_pose.pose.orientation.y = base_q.y();
+        corrected_pose.pose.orientation.z = base_q.z();
+        corrected_pose.pose.orientation.w = base_q.w();
+        return true;
     }
 };
 

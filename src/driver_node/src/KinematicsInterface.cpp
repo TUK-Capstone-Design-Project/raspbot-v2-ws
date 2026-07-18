@@ -58,7 +58,24 @@ bool KinematicsInterface::is_connected() const
 { return (fd_ >= 0) || is_simulation_; }
 
 void KinematicsInterface::stop()
-{ drive(0.0, 0.0, 0.0); }
+{
+    drive(0.0, 0.0, 0.0);
+    effective_vx_ = 0.0;
+    effective_vy_ = 0.0;
+    effective_wz_ = 0.0;
+
+    // drive()는 평소에는 다음 100ms motor tick에 적용될 의도 PWM만 갱신한다.
+    // 보정 정지와 fault 정지는 즉시 물리 출력이 0이 되어야 하므로 여기서는
+    // 다음 tick을 기다리지 않고 네 모터에 직접 정지 명령을 보낸다.
+    if (!is_simulation_ && fd_ >= 0) {
+        for (int i = 0; i < 4; ++i) {
+            set_motor(i, 0);
+            accumulator_[i]     = 0.0;
+            pulse_remaining_[i] = 0;
+            was_modulating_[i]  = false;
+        }
+    }
+}
 
 int KinematicsInterface::set_motor(int id, int speed)
 {
@@ -144,33 +161,21 @@ void KinematicsInterface::drive(double vx, double vy, double wz)
     intended_pwm_[2] = fr_lin + fr_ang;
     intended_pwm_[3] = rr_lin + rr_ang;
 
-    // odom용 effective 속도: tick()의 펄스 변조 평균이 의도 PWM과 일치하므로
-    // 의도값 그대로 사용. 단, |의도| < deadzone 인 휠은 실제로 못 움직이므로 0으로 반영.
-    auto eff_wheel = [this](double p) {
-        return (std::abs(p) < pwm_deadzone_) ? 0.0 : p / speed_scale_;
-    };
-    double wfl = eff_wheel(intended_pwm_[0]);
-    double wrl = eff_wheel(intended_pwm_[1]);
-    double wfr = eff_wheel(intended_pwm_[2]);
-    double wrr = eff_wheel(intended_pwm_[3]);
-
-    // 메카넘 정기구학: 휠 속도 → 로봇 좌표계 속도
-    effective_vx_ = (wfl + wfr + wrl + wrr) / 4.0;
-    effective_vy_ = (-wfl + wfr + wrl - wrr) / 4.0;
-    effective_wz_ = (-wfl + wfr - wrl + wrr) / (4.0 * K_);
+    // effective 속도는 의도값이 아니라 tick()에서 실제 I2C로 적용한 PWM으로 갱신한다.
 }
 
 void KinematicsInterface::tick()
 {
     if (is_simulation_ || fd_ < 0) return;
 
+    int applied_pwm[4] = { 0, 0, 0, 0 };
     for (int i = 0; i < 4; ++i) {
         double intended     = intended_pwm_[i];
         double abs_intended = std::abs(intended);
 
         if (abs_intended >= min_pwm_) {
             // 충분히 큰 PWM — 그대로 출력 (연속 모드)
-            set_motor(i, static_cast<int>(std::round(intended)));
+            applied_pwm[i] = set_motor(i, static_cast<int>(std::round(intended)));
             accumulator_[i]     = 0.0;
             pulse_remaining_[i] = 0;
             was_modulating_[i]  = false;
@@ -189,7 +194,7 @@ void KinematicsInterface::tick()
 
         if (abs_weighted < pwm_deadzone_) {
             // weighted 도 deadzone 미만이면 진짜 무의미한 명령 — 정지
-            set_motor(i, 0);
+            applied_pwm[i] = set_motor(i, 0);
             accumulator_[i]     = 0.0;
             pulse_remaining_[i] = 0;
             was_modulating_[i]  = false;
@@ -209,21 +214,31 @@ void KinematicsInterface::tick()
 
         if (pulse_remaining_[i] > 0) {
             // 진행 중인 펄스 트레인 — 계속 ON
-            set_motor(i, sign * min_pwm_);
+            applied_pwm[i] = set_motor(i, sign * min_pwm_);
             pulse_remaining_[i]--;
         } else {
             double threshold = static_cast<double>(min_pwm_) * modulation_pulse_ticks_;
             if (std::abs(accumulator_[i]) >= threshold) {
                 // 새 펄스 트레인 시작 (첫 틱은 지금 ON, 나머지 (N-1)틱은 다음 호출에서)
                 sign = (accumulator_[i] > 0) ? 1 : -1;
-                set_motor(i, sign * min_pwm_);
+                applied_pwm[i] = set_motor(i, sign * min_pwm_);
                 accumulator_[i] -= sign * threshold;
                 pulse_remaining_[i] = modulation_pulse_ticks_ - 1;
             } else {
-                set_motor(i, 0);
+                applied_pwm[i] = set_motor(i, 0);
             }
         }
     }
+
+    // ID 매핑: 0=FL, 1=RL, 2=FR, 3=RR. set_motor() 반환값은
+    // deadzone/min/max 보정까지 끝나 실제 하드웨어에 기록된 PWM이다.
+    const double wfl = applied_pwm[0] / speed_scale_;
+    const double wrl = applied_pwm[1] / speed_scale_;
+    const double wfr = applied_pwm[2] / speed_scale_;
+    const double wrr = applied_pwm[3] / speed_scale_;
+    effective_vx_ = (wfl + wfr + wrl + wrr) / 4.0;
+    effective_vy_ = (-wfl + wfr + wrl - wrr) / 4.0;
+    effective_wz_ = (-wfl + wfr - wrl + wrr) / (4.0 * K_);
 }
 
 void KinematicsInterface::get_effective_velocity(double &vx, double &vy, double &wz) const

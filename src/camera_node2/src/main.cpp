@@ -53,13 +53,22 @@ public:
 private:
     void capture_loop()
     {
-        size_t      frame_size = width_ * height_ * 3 / 2; // YUV420
-        std::string command    = std::format(
-            "rpicam-vid -t 0 --width {} --height {} --framerate {} "
-            "--codec yuv420 --nopreview --flush -o -",
-            width_, height_, fps_
-        );
+        size_t frame_size = width_ * height_ * 3 / 2; // YUV420
 
+        // std::string command    = std::format(
+        //     "rpicam-vid -t 0 --width {} --height {} --framerate {} "
+        //     "--codec yuv420 --nopreview --flush -o -",
+        //     width_, height_, fps_
+        // );
+        std::string command = std::format(
+            "rpicam-vid -t 0 "
+            "--width {} --height {} --framerate {} "
+            "--mode {}:{}:8 "
+            "--shutter 2000 --gain 13 "
+            "--codec yuv420 --nopreview --flush -o -",
+            width_, height_, fps_,
+            width_, height_
+        );
         FILE *pipe = popen(command.c_str(), "r");
         if (!pipe) {
             RCLCPP_ERROR(this->get_logger(), "rpicam-vid 파이프를 열 수 없습니다.");
